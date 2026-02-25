@@ -150,7 +150,7 @@ def resume_from_ckpt(config, accelerator, transformer):
                 try:
                     load_model_weights(path_ckpt, transformer)
                     print("Loaded only model weights")
-                except:
+                except Exception:
                     logger.warning(f"Failed to load checkpoint: {e}")
                     if is_latest_resume:
                         logger.warning("Remove the broken checkpoint and exit.")

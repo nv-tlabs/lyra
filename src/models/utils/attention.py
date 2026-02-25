@@ -28,7 +28,7 @@ try:
     torch._dynamo.config.cache_size_limit = 1000
     from torch.nn.attention.flex_attention import flex_attention as flex_attn_func
     flex_attn_func_compiled = torch.compile(flex_attn_func)
-except:
+except (ImportError, RuntimeError):
     warnings.warn("flex_attn is not available")
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
