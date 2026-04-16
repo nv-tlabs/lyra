@@ -30,8 +30,8 @@ NVIDIA <br>
 ## News
 
 - 🚀 [April 15, 2026] Paper, model weights, and inference code are now publicly available!
-- 🔜 GUI for interactive scene generation coming soon.
-- 🔜 4-step distillation lora coming soon.
+- 🔜 [Coming Soon] GUI for interactive scene generation.
+- 🔜 [Coming Soon] 4-step distillation LoRA.
 
 ## Installation
 
@@ -119,8 +119,6 @@ PYTHONPATH=. python -m lyra_2._src.inference.lyra2_custom_traj_inference \
 Output: `outputs/custom_traj/<image_name>.mp4`
 
 > **Note:** The model may hallucinate objects along the predefined trajectory, which can lead to degenerated results. Additionally, the input trajectory is always relative to the monocular depth estimated from the first frame, so the actual camera path may differ from what you expect. You can adjust `--pose_scale` to scale your trajectory.
-
-**Runtime on 1× H100 80GB:** ~9 min per 80 frames.
 
 **Example outputs (Step 1 video generation | Step 2 GS reconstruction):**
 
