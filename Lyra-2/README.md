@@ -1,6 +1,6 @@
 # Lyra 2.0: Explorable Generative 3D Worlds
 
-<video src="https://github.com/user-attachments/assets/f47c24c0-453e-4134-84f1-80c56613f4af" autoplay controls loop muted width="720"></video>
+<video src="https://github.com/user-attachments/assets/f47c24c0-453e-4134-84f1-80c56613f4af" autoplay controls loop muted playsinline width="720"></video>
 
 **Lyra 2.0: Explorable Generative 3D Worlds**<br>
 [Tianchang Shen\*](https://www.cs.toronto.edu/~shenti11/),
@@ -90,8 +90,8 @@ Outputs written to `outputs/zoomgs/<sample_id>/`:
 **Example outputs (Step 1 video generation | Step 2 GS reconstruction):**
 
 <table><tr>
-<td><video src="https://github.com/user-attachments/assets/12cb922d-da2a-4ede-9bfb-eb970213951a" autoplay controls loop muted preload="auto" width="360"></video></td>
-<td><video src="https://github.com/user-attachments/assets/0d44e0fa-e7e3-4bd2-af42-3bd2ec7dffc0" autoplay controls loop muted preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/12cb922d-da2a-4ede-9bfb-eb970213951a" autoplay controls loop muted playsinline preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/0d44e0fa-e7e3-4bd2-af42-3bd2ec7dffc0" autoplay controls loop muted playsinline preload="auto" width="360"></video></td>
 </tr></table>
 
 #### Option 2: Custom Trajectory
@@ -125,15 +125,15 @@ Output: `outputs/custom_traj/<image_name>.mp4`
 **Example outputs (Step 1 video generation | Step 2 GS reconstruction):**
 
 <table><tr>
-<td><video src="https://github.com/user-attachments/assets/61cfe2f0-b0bf-4077-8367-49968aca7a19" autoplay controls loop muted preload="auto" width="360"></video></td>
-<td><video src="https://github.com/user-attachments/assets/61354390-cb6f-484b-87c6-f7ef7ca466f2" autoplay controls loop muted preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/61354390-cb6f-484b-87c6-f7ef7ca466f2" autoplay controls loop muted playsinline preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/61cfe2f0-b0bf-4077-8367-49968aca7a19" autoplay controls loop muted playsinline preload="auto" width="360"></video></td>
 </tr></table>
 
 #### Option 3: Interactive GUI (Coming Soon!)
 
 We will release our interactive GUI, an online captioning pipeline, and an instruction video in an upcoming update. Stay tuned!
 
-<video src="https://github.com/user-attachments/assets/76394f4d-b6c7-46f2-8133-5eabf5fd74e1" autoplay controls loop muted preload="auto" width="480"></video>
+<video src="https://github.com/user-attachments/assets/76394f4d-b6c7-46f2-8133-5eabf5fd74e1" autoplay controls loop muted playsinline preload="auto" width="360"></video>
 
 ### Step 2 — 3D Gaussian Splatting Reconstruction
 
