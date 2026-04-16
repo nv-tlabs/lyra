@@ -1,0 +1,6 @@
+[submodule "lyra_2/_src/inference/depth_anything_3"]
+	path = lyra_2/_src/inference/depth_anything_3
+	url = https://github.com/frankshen07/Depth-Anything-3.git
+[submodule "lyra_2/_src/inference/vipe"]
+	path = lyra_2/_src/inference/vipe
+	url = https://github.com/nv-tlabs/vipe.git

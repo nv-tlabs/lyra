@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# claude api
+.claude/settings.json
+
+# huggingface
+.hf
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Model files and data
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+data/
+checkpoints/
+outputs/
+logs/
+wandb/
+eval_results
+
+# Temporary files
+*.log
+*.tmp
+tmp/
+temp/
+*.mp4
+
+# Assets
+
+debug/
+raw_data
+raw_data/
+slurm_out/
+my-*
+
+test_vsr_condition_broadcast.py
+imaginaire4/
+*.sqsh
+
+
+credentials/*.secret
+results/
+
+# Checkpoint cleanup
+.checkpoint_keep
+attn_mask_vis/
+attn_mask_vis_*
