@@ -90,8 +90,8 @@ Outputs written to `outputs/zoomgs/<sample_id>/`:
 **Example outputs (Step 1 video generation | Step 2 GS reconstruction):**
 
 <table><tr>
-<td><video src="assets/example_outputs/video_8x.mp4" autoplay controls loop muted preload="auto" width="360"></video></td>
-<td><video src="assets/example_outputs/gs_render_8x.mp4" autoplay controls loop muted preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/12cb922d-da2a-4ede-9bfb-eb970213951a" autoplay controls loop muted preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/0d44e0fa-e7e3-4bd2-af42-3bd2ec7dffc0" autoplay controls loop muted preload="auto" width="360"></video></td>
 </tr></table>
 
 #### Option 2: Custom Trajectory
@@ -126,7 +126,7 @@ Output: `outputs/custom_traj/<image_name>.mp4`
 
 We will release our interactive GUI, an online captioning pipeline, and an instruction video in an upcoming update. Stay tuned!
 
-<video src="assets/example_outputs/gui.mp4" autoplay controls loop muted preload="auto" width="720"></video>
+<video src="https://github.com/user-attachments/assets/76394f4d-b6c7-46f2-8133-5eabf5fd74e1" autoplay controls loop muted preload="auto" width="720"></video>
 
 ### Step 2 — 3D Gaussian Splatting Reconstruction
 
