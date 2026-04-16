@@ -57,7 +57,12 @@ torch.backends.cudnn.enabled = False
 # Trajectory loading
 # ---------------------------------------------------------------------------
 
-def load_trajectory(path: str, num_frames: int, target_hw: tuple[int, int] | None = None):
+def load_trajectory(
+    path: str,
+    num_frames: int,
+    target_hw: tuple[int, int] | None = None,
+    pose_scale: float = 1.0,
+):
     """Load camera trajectory from an .npz file.
 
     Expected keys:
@@ -73,6 +78,9 @@ def load_trajectory(path: str, num_frames: int, target_hw: tuple[int, int] | Non
     data = np.load(path)
     w2c = torch.from_numpy(data["w2c"][:num_frames].astype(np.float32))
     intrinsics = torch.from_numpy(data["intrinsics"][:num_frames].astype(np.float32))
+
+    if pose_scale != 1.0:
+        w2c[:, :3, 3] *= pose_scale
 
     if target_hw is not None and "image_height" in data and "image_width" in data:
         orig_h, orig_w = int(data["image_height"]), int(data["image_width"])
@@ -127,6 +135,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=161,
                         help="Number of frames to generate (taken from the start of the trajectory).")
+    parser.add_argument("--pose_scale", type=float, default=1.1,
+                        help="Scale factor applied to w2c translation vectors.")
     parser.add_argument("--resolution", type=str, default="480,832", help="H,W")
     parser.add_argument("--context_parallel_size", type=int, default=1)
     parser.add_argument("--lora_paths", type=str, default=None, nargs="+")
@@ -136,6 +146,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true")
 
     # Depth backend
+    parser.add_argument("--use_moge_scale", action=argparse.BooleanOptionalAction, default=True,
+                        help="Align DA3 depth to MoGe scale (default: True).")
     parser.add_argument("--depth_backend", type=str, default="da3", choices=["da3"])
     parser.add_argument("--da3_model_name", type=str, default="depth-anything/DA3NESTED-GIANT-LARGE-1.1")
     parser.add_argument("--da3_model_path_custom", type=str, default=None)
@@ -242,6 +254,15 @@ if __name__ == "__main__":
     )
     da3_model.eval()
 
+    # ---- Optionally load MoGe model for depth scale alignment ----
+    moge_model = None
+    if args.use_moge_scale:
+        from lyra_2._src.inference.depth_utils import load_moge_model
+        moge_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        moge_model = load_moge_model(moge_device)
+        moge_model.eval()
+        log.info("MoGe model loaded for depth scale alignment.", rank0_only=True)
+
     # ---- Resolve image(s) ----
     image_paths = _build_image_list(args.input_image_path)[
         args.sample_start_idx : args.sample_start_idx + args.num_samples
@@ -275,7 +296,7 @@ if __name__ == "__main__":
             log.error(f"Trajectory file not found: {traj_file}")
             continue
 
-        w2cs_T_44, Ks_T_33 = load_trajectory(traj_file, N, target_hw=(target_h, target_w))
+        w2cs_T_44, Ks_T_33 = load_trajectory(traj_file, N, target_hw=(target_h, target_w), pose_scale=args.pose_scale)
         log.info(f"Loaded trajectory: {w2cs_T_44.shape[0]} frames from {traj_file}", rank0_only=True)
 
         # ---- Read image ----
@@ -294,6 +315,54 @@ if __name__ == "__main__":
             target_hw=(target_h, target_w),
         )
         H, W = image_chw01.shape[-2:]
+
+        # ---- Optionally align DA3 depth to MoGe scale ----
+        if args.use_moge_scale and moge_model is not None:
+            log.info("Aligning DA3 depth to MoGe scale...", rank0_only=True)
+            from lyra_2._src.inference.depth_utils import moge_infer_depth_intrinsics
+
+            moge_model.to(desired_device)
+            with torch.nn.attention.sdpa_kernel(
+                [torch.nn.attention.SDPBackend.MATH]
+            ):
+                _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
+                    moge_model,
+                    rgb_t,
+                    depth_pred_hw=(target_h, target_w),
+                    target_hw=(target_h, target_w),
+                )
+
+            da3_d = depth_hw.to(moge_depth_hw.device)
+            da3_m = mask_hw.to(moge_mask_hw.device)
+
+            valid_mask = (da3_m > 0.5) & (moge_mask_hw > 0.5)
+            if valid_mask.sum() > 10:
+                d_da3_vals = da3_d[valid_mask]
+                d_moge_vals = moge_depth_hw[valid_mask]
+
+                inv_da3 = 1.0 / (d_da3_vals + 1e-6)
+                inv_moge = 1.0 / (d_moge_vals + 1e-6)
+
+                numerator = (inv_da3 * inv_moge).sum()
+                denominator = (inv_da3 * inv_da3).sum()
+
+                if denominator > 1e-8:
+                    scale = numerator / denominator
+                    log.info(f"Global inverse-depth scale factor: {scale.item()}", rank0_only=True)
+                    if scale > 1e-6:
+                        depth_hw = depth_hw / scale.to(depth_hw.device)
+                    else:
+                        log.warning(f"Scale too small ({scale.item()}), skipping alignment.", rank0_only=True)
+                else:
+                    log.warning("Denominator too small for LS scale alignment.", rank0_only=True)
+            else:
+                log.warning("Not enough overlapping valid pixels for scale alignment.", rank0_only=True)
+
+            moge_model.cpu()
+            del moge_depth_hw, moge_mask_hw, da3_d, da3_m
+            torch.cuda.empty_cache()
+            gc.collect()
+
         img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0
 
         # ---- Load captions ----

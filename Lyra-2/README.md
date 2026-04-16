@@ -107,12 +107,12 @@ The script loads the first `--num_frames` poses from the trajectory file and run
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 PYTHONPATH=. python -m lyra_2._src.inference.lyra2_custom_traj_inference \
-  --input_image_path assets/custom_trajectory_examples/Courthouse_3/first_frame.png \
-  --trajectory_path assets/custom_trajectory_examples/Courthouse_3/trajectory.npz \
+  --input_image_path assets/custom_trajectory_examples/example_0/first_frame.png \
+  --trajectory_path assets/custom_trajectory_examples/example_0/trajectory.npz \
   --experiment lyra2 \
   --checkpoint_dir checkpoints/model \
-  --captions_path assets/custom_trajectory_examples/Courthouse_3/captions.json \
-  --num_frames 161 \
+  --captions_path assets/custom_trajectory_examples/example_0/captions.json \
+  --num_frames 481 \
   --output_path outputs/custom_traj
 ```
 
@@ -122,11 +122,18 @@ Output: `outputs/custom_traj/<image_name>.mp4`
 
 **Runtime on 1× H100 80GB:** ~9 min per 80 frames.
 
+**Example outputs (Step 1 video generation | Step 2 GS reconstruction):**
+
+<table><tr>
+<td><video src="https://github.com/user-attachments/assets/61cfe2f0-b0bf-4077-8367-49968aca7a19" autoplay controls loop muted preload="auto" width="360"></video></td>
+<td><video src="https://github.com/user-attachments/assets/61354390-cb6f-484b-87c6-f7ef7ca466f2" autoplay controls loop muted preload="auto" width="360"></video></td>
+</tr></table>
+
 #### Option 3: Interactive GUI (Coming Soon!)
 
 We will release our interactive GUI, an online captioning pipeline, and an instruction video in an upcoming update. Stay tuned!
 
-<video src="https://github.com/user-attachments/assets/76394f4d-b6c7-46f2-8133-5eabf5fd74e1" autoplay controls loop muted preload="auto" width="720"></video>
+<video src="https://github.com/user-attachments/assets/76394f4d-b6c7-46f2-8133-5eabf5fd74e1" autoplay controls loop muted preload="auto" width="480"></video>
 
 ### Step 2 — 3D Gaussian Splatting Reconstruction
 
