@@ -502,10 +502,11 @@ def requantize_checkpoint(
 
 
 def _build_uvw_compat_metadata(
-    voxel_res: int = 256,
-    bits_per_axis: int = 8,
-    tiles_per_row: int = 16,
-    default_world_extent_m: float = 4.0,
+    voxel_res: int = 4096,
+    bits_per_axis: int = 16,
+    world_extent_m: float = 45.0,
+    storage_mode: str = "sparse-tiled",
+    tile_voxel_res: int = 256,
     precompute_canonical_meshes: bool = True,
     canonical_configs: list[tuple[int, int, int]] | None = None,
 ) -> dict:
@@ -513,16 +514,32 @@ def _build_uvw_compat_metadata(
     checkpoint. Travels alongside the fp8 weights so a UVW-aware runtime
     auto-configures without per-load math.
 
+    Defaults are sized for Lyra 2's documented 90 m walkable spec:
+      - voxel_res=4096  -> 2.2 cm cells (over a 90 m cube)
+      - bits_per_axis=16 -> RGBA16UI byte width; 65k addressable per axis,
+                            plenty of headroom
+      - world_extent_m=45 -> 90 m world cube (Lyra 2's documented spec)
+      - storage_mode='sparse-tiled' -> a 4096-cubed dense atlas would be
+                            ~256 GB so dense single-texture is impractical;
+                            sparse-tile storage with 256-cubed leaf tiles
+                            is the production-realistic choice
+      - tile_voxel_res=256 -> each sparse leaf is one 256-cubed atlas, the
+                            same shape as DownToEarth's hamlet-scale unit;
+                            preserves locality and ships at ~64 MB per
+                            populated tile
+
+    The DownToEarth hamlet-scale defaults (voxel_res=256, RGBA8,
+    world_extent=4 m, dense storage) are accessible via explicit override.
+
     What this is: a marker + config block. It does NOT change how the
     model interprets inputs; that still requires the conditioning-head
     fine-tune that mods #1 and #2 of PR #61 propose. What it DOES:
 
-      - Specifies the bijection layout (atlas dims, tile layout, byte width)
-        so a UVW-aware runtime knows which member of the byte-width
-        family this checkpoint is paired with.
+      - Specifies the bijection layout (resolution, byte width, storage
+        mode) so a UVW-aware runtime knows which configuration applies.
       - Carries optional pre-computed canonical-coord meshes for the
         standard inference configs (saves a few ms per inference start).
-      - Marks the checkpoint as 'uvw_compat_version: 1' so future
+      - Marks the checkpoint with 'uvw_compat_version: 2' so future
         runtimes can detect compatibility.
 
     Stored under the '_lyra_uvw_metadata' key in the output checkpoint
@@ -530,17 +547,22 @@ def _build_uvw_compat_metadata(
     loaders -- they just ignore unrecognised keys.
 
     Args:
-        voxel_res: per-axis voxel grid resolution (256 for RGBA8)
-        bits_per_axis: 8 / 16 / 32 -- which byte-width family member
-        tiles_per_row: 2D atlas tile layout (16 for 256-cubed)
-        default_world_extent_m: default world half-width in metres (4.0
-            matches voxgaussian's hamlet-scale default; scene-time overrides
-            available at inference)
+        voxel_res: per-axis voxel grid resolution. Default 4096 for Lyra 2;
+            use 256 for DownToEarth hamlet scale, 8192+ for sub-cm Lyra 2,
+            higher for planet-scale (with hierarchical sparse storage).
+        bits_per_axis: 8 / 16 / 32 -- which byte-width family member.
+            Default 16 covers voxel_res up to 65,536.
+        world_extent_m: scene half-width in metres. Default 45.0 (=90 m
+            world cube) matches Lyra 2's documented walkable spec.
+        storage_mode: 'dense' | 'sparse-tiled' | 'hierarchical-octree'.
+            Default 'sparse-tiled' is the only practical choice above
+            voxel_res=512 since dense storage exceeds GPU memory.
+        tile_voxel_res: per-leaf-tile resolution for sparse modes (256
+            matches the DownToEarth bijection's natural unit).
         precompute_canonical_meshes: include the canonical-coord starting
-            grid for the standard (H, W, num_spatial_hist) configurations
+            grid for the standard (H, W, num_spatial_hist) configurations.
         canonical_configs: list of (H, W, num_spatial_hist) tuples to
-            pre-compute. Default: [(480, 832, 5)] which matches Lyra 2's
-            documented production config.
+            pre-compute. Default: [(480, 832, 5)] (Lyra 2 production).
 
     Returns:
         A dict suitable for storage in the checkpoint.
@@ -550,18 +572,35 @@ def _build_uvw_compat_metadata(
     if canonical_configs is None:
         canonical_configs = [(480, 832, 5)]   # Lyra 2's published config
 
+    # Compute per-cell metrics for the metadata consumer
+    cell_size_cm = (2.0 * world_extent_m * 100.0) / voxel_res
+    total_voxels = voxel_res ** 3
+    total_voxels_dense_bytes_rgba = total_voxels * 4
+    # For sparse mode: per-tile resource cost
+    tile_count_per_axis = max(1, voxel_res // tile_voxel_res)
+    tile_count_total = tile_count_per_axis ** 3
+    tile_summary_atlas_bytes = tile_voxel_res ** 3 * 4         # RGBA8 per tile
+    tile_occupancy_bitmap_bytes = tile_voxel_res ** 3 // 8     # 1-bit per voxel per tile
+
     metadata = {
-        "uvw_compat_version": 1,
+        "uvw_compat_version": 2,
         "voxel_res": voxel_res,
         "bits_per_axis": bits_per_axis,
-        "tiles_per_row": tiles_per_row,
-        "atlas_w": voxel_res * tiles_per_row,
-        "atlas_h": voxel_res * (voxel_res // tiles_per_row),
-        "default_world_extent_m": default_world_extent_m,
-        "default_world_min": [-default_world_extent_m] * 3,
-        "default_world_max": [+default_world_extent_m] * 3,
-        "occupancy_bitmap_bytes": (voxel_res * tiles_per_row) * (voxel_res * (voxel_res // tiles_per_row)) // 8,
-        "summary_atlas_bytes": (voxel_res * tiles_per_row) * (voxel_res * (voxel_res // tiles_per_row)) * 4,  # RGBA8
+        "world_extent_m": world_extent_m,
+        "world_min": [-world_extent_m] * 3,
+        "world_max": [+world_extent_m] * 3,
+        "cell_size_cm": cell_size_cm,
+        "total_voxels_addressable": total_voxels,
+        "storage_mode": storage_mode,
+        "tile_voxel_res": tile_voxel_res,
+        "tile_count_per_axis": tile_count_per_axis,
+        "tile_count_total_addressable": tile_count_total,
+        "per_tile_summary_atlas_bytes": tile_summary_atlas_bytes,
+        "per_tile_occupancy_bitmap_bytes": tile_occupancy_bitmap_bytes,
+        # Heads-up: a fully populated dense atlas would be this many bytes.
+        # For typical 5% surface occupancy, multiply by ~0.05 for the
+        # realistic sparse storage budget.
+        "dense_atlas_bytes_if_populated": total_voxels_dense_bytes_rgba,
         "downtoearth_bijection_url": "https://github.com/MiLO83/DownToEarth/blob/main/voxgaussian/pipeline/uvw_atlas.py",
     }
 
@@ -594,6 +633,12 @@ def requantize_streaming(
     skip_modules: list[str] | None = None,
     progress: bool = True,
     bake_uvw_metadata: bool = True,
+    # UVW metadata defaults match Lyra 2's documented spec (90 m world,
+    # cm-scale features). Override these for DownToEarth-scale (voxel_res=256,
+    # bits=8, world=4 m) or planet-scale (voxel_res=65536+, bits=32) use.
+    uvw_voxel_res: int = 4096,
+    uvw_bits_per_axis: int = 16,
+    uvw_world_extent_m: float = 45.0,
 ) -> None:
     """Streaming requantization: cast weights tensor-by-tensor at the
     state_dict level, no full-model load required. Runs on any machine
@@ -732,9 +777,18 @@ def requantize_streaming(
     # A UVW-aware runtime auto-configures from this block; older loaders
     # ignore the unrecognised key.
     if bake_uvw_metadata:
-        output["_lyra_uvw_metadata"] = _build_uvw_compat_metadata()
+        uvw_meta = _build_uvw_compat_metadata(
+            voxel_res=uvw_voxel_res,
+            bits_per_axis=uvw_bits_per_axis,
+            world_extent_m=uvw_world_extent_m,
+        )
+        output["_lyra_uvw_metadata"] = uvw_meta
         print(f"[requantize-streaming] baked UVW compat metadata "
-              f"(version 1, atlas 4096x4096, voxel-res 256, 8 bits/axis)")
+              f"(v{uvw_meta['uvw_compat_version']}, voxel-res "
+              f"{uvw_meta['voxel_res']}^3, {uvw_meta['bits_per_axis']} "
+              f"bits/axis, world {uvw_meta['world_extent_m']*2:.0f}m cube, "
+              f"cell {uvw_meta['cell_size_cm']:.1f}cm, "
+              f"storage={uvw_meta['storage_mode']})")
     # Preserve any other top-level keys from the original (config, optim, etc.)
     if outer is not None:
         for k, v in outer.items():
@@ -842,6 +896,24 @@ if __name__ == "__main__":
              "canonical-coord meshes (saves ~few KB but defeats the "
              "UVW-aware runtime auto-config). Default: bake the metadata.",
     )
+    rqs.add_argument(
+        "--uvw-voxel-res", type=int, default=4096,
+        help="UVW bijection voxel grid resolution per axis. Default 4096 "
+             "(matches Lyra 2's 90 m walkable spec at ~2.2 cm cells). "
+             "Use 256 for DownToEarth hamlet scale (~3 cm cells in 8 m), "
+             "or 8192+ for sub-cm Lyra 2 detail.",
+    )
+    rqs.add_argument(
+        "--uvw-bits-per-axis", type=int, choices=[8, 16, 32], default=16,
+        help="UVW bijection address byte-width. 8 maxes at voxel_res=256, "
+             "16 maxes at 65536, 32 effectively unbounded. Default 16 fits "
+             "any Lyra-2-scale config.",
+    )
+    rqs.add_argument(
+        "--uvw-world-extent-m", type=float, default=45.0,
+        help="World half-width in metres. Default 45 (=90 m cube, Lyra 2 "
+             "spec). Use 4 for DownToEarth hamlet scale.",
+    )
 
     inspect = sub.add_parser("inspect", help="Print quantization metadata of a checkpoint")
     inspect.add_argument("checkpoint", help="Path to .pth checkpoint")
@@ -855,6 +927,9 @@ if __name__ == "__main__":
             skip_modules=args.skip,
             progress=not args.no_progress,
             bake_uvw_metadata=not args.no_bake_uvw,
+            uvw_voxel_res=args.uvw_voxel_res,
+            uvw_bits_per_axis=args.uvw_bits_per_axis,
+            uvw_world_extent_m=args.uvw_world_extent_m,
         )
     elif args.command == "inspect":
         mode = detect_checkpoint_quantization(args.checkpoint)
@@ -865,15 +940,39 @@ if __name__ == "__main__":
             data = easy_io.load(args.checkpoint, map_location="cpu")
             if isinstance(data, dict) and "_lyra_uvw_metadata" in data:
                 uvw = data["_lyra_uvw_metadata"]
-                print(f"UVW compat version:      {uvw.get('uvw_compat_version', '?')}")
-                print(f"  voxel resolution:      {uvw.get('voxel_res')}^3")
-                print(f"  bits per axis:         {uvw.get('bits_per_axis')}")
-                print(f"  atlas dims:            {uvw.get('atlas_w')}x{uvw.get('atlas_h')}")
-                print(f"  occupancy bitmap:      {uvw.get('occupancy_bitmap_bytes', 0) / 1024:.1f} KB")
-                print(f"  summary atlas (rgba8): {uvw.get('summary_atlas_bytes', 0) / 1024 / 1024:.1f} MB")
+                v = uvw.get("uvw_compat_version", "?")
+                print(f"UVW compat version:        {v}")
+                if v >= 2:
+                    # New format (v2+): scene-scale aware
+                    vr = uvw.get("voxel_res", "?")
+                    bpa = uvw.get("bits_per_axis", "?")
+                    we = uvw.get("world_extent_m", "?")
+                    cs = uvw.get("cell_size_cm", "?")
+                    sm = uvw.get("storage_mode", "?")
+                    print(f"  voxel resolution:        {vr}^3 ({uvw.get('total_voxels_addressable', '?'):,} voxels)")
+                    print(f"  bits per axis:           {bpa}")
+                    print(f"  world extent:            {we} m half-width ({we*2:.0f} m cube)")
+                    print(f"  cell size:               {cs:.2f} cm" if isinstance(cs, (int, float)) else f"  cell size:               {cs}")
+                    print(f"  storage mode:            {sm}")
+                    if sm == "sparse-tiled":
+                        tvr = uvw.get("tile_voxel_res", "?")
+                        tcpa = uvw.get("tile_count_per_axis", "?")
+                        ts_mb = uvw.get("per_tile_summary_atlas_bytes", 0) / 1024 / 1024
+                        to_mb = uvw.get("per_tile_occupancy_bitmap_bytes", 0) / 1024 / 1024
+                        print(f"  tile voxel res:          {tvr}^3")
+                        print(f"  tile grid:               {tcpa}^3 = {tcpa**3 if isinstance(tcpa, int) else '?'} addressable tiles")
+                        print(f"  per-tile summary atlas:  {ts_mb:.1f} MB (RGBA8)")
+                        print(f"  per-tile occ bitmap:     {to_mb:.2f} MB")
+                    dense_gb = uvw.get("dense_atlas_bytes_if_populated", 0) / 1024**3
+                    print(f"  dense atlas if populated: {dense_gb:.1f} GB (sparse at ~5% = {dense_gb*0.05:.1f} GB realistic)")
+                else:
+                    # Legacy v1 format
+                    print(f"  voxel resolution:        {uvw.get('voxel_res')}^3")
+                    print(f"  bits per axis:           {uvw.get('bits_per_axis')}")
+                    print(f"  atlas dims:              {uvw.get('atlas_w')}x{uvw.get('atlas_h')}")
                 meshes = uvw.get("precomputed_canonical_meshes", {})
                 if meshes:
-                    print(f"  pre-computed meshes:   {list(meshes.keys())}")
+                    print(f"  pre-computed meshes:     {list(meshes.keys())}")
             else:
                 print("UVW compat: (no metadata baked in)")
         except Exception as e:
