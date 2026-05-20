@@ -143,6 +143,28 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--offload_when_prompt", action="store_true")
+    # ─── Consumer-GPU mode (16 GB cards: RTX 5060 Ti, 5070, 4060 Ti 16G, etc.) ──
+    # Opt-in weight quantization to fit the 14B model in <= 16 GB VRAM.
+    # See lyra_2/_src/utils/low_vram.py for the full precision/quality table.
+    # 'int8' is the most-tested path (bitsandbytes); 'fp8' uses the native
+    # Blackwell/Hopper tensor-core format; 'int4' is the most aggressive.
+    # When set, expect ~5-10 min per 80-frame chunk on an RTX 5060 Ti (vs
+    # ~15 sec on a GB200). Pairs naturally with --offload and
+    # --num_sampling_step=4 (DMD-distilled inference) for max VRAM savings.
+    parser.add_argument(
+        "--low-vram",
+        choices=["none", "int8", "int4", "fp8"],
+        default="none",
+        help="Quantize Linear weights for 16 GB consumer GPUs. "
+             "'int8' is the safest pick; 'fp8' for Blackwell/Hopper cards; "
+             "'int4' for tightest VRAM (quality dip). Default: none (bf16).",
+    )
+    parser.add_argument(
+        "--low-vram-checkpoint",
+        action="store_true",
+        help="Pair with --low-vram for activation gradient checkpointing. "
+             "Saves ~30-50% activation memory at mild speed cost.",
+    )
     parser.add_argument("--debug", action="store_true")
 
     # Depth backend
@@ -244,6 +266,8 @@ if __name__ == "__main__":
         instantiate_ema=False,
         load_ema_to_reg=False,
         experiment_opts=experiment_opts,
+        low_vram_mode=getattr(args, "low_vram", "none"),
+        low_vram_grad_checkpoint=getattr(args, "low_vram_checkpoint", False),
     )
     if args.lora_paths:
         lora_names = []

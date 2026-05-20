@@ -37,6 +37,11 @@ def load_model_from_checkpoint(
     seed=0,
     experiment_opts: list[str] = [],
     strict=True,
+    # Optional consumer-GPU memory reduction. See lyra_2/_src/utils/low_vram.py
+    # for the full set of options. Defaults preserve existing behaviour
+    # (bf16 model, no quantization).
+    low_vram_mode: str = "none",                  # 'none' | 'int8' | 'int4' | 'fp8'
+    low_vram_grad_checkpoint: bool = False,
 ):
     """
     experiment_name: experiment name
@@ -44,6 +49,11 @@ def load_model_from_checkpoint(
     config_file: config file path
     enable_fsdp: enable fsdp
     seed: random seed
+    low_vram_mode: opt-in weight quantization for consumer GPUs. Use 'int8'
+        on a 16 GB card (RTX 5060 Ti / 5070 / 4060 Ti 16G / etc.). See
+        lyra_2/_src/utils/low_vram.py for the precision/quality table.
+    low_vram_grad_checkpoint: pair with the above to save activation memory
+        during inference (mild speed cost).
     """
     config_module = get_config_module(config_file)
     config = importlib.import_module(config_module).make_config()
@@ -92,5 +102,17 @@ def load_model_from_checkpoint(
         _model_wrapper.load_state_dict(_state_dict)
 
     torch.cuda.empty_cache()
+
+    # Optional consumer-GPU memory reduction. Applied after weight load
+    # so the quantization sees the trained values, not the random init.
+    # No-op if low_vram_mode == 'none' and low_vram_grad_checkpoint is False.
+    if low_vram_mode != "none" or low_vram_grad_checkpoint:
+        from lyra_2._src.utils.low_vram import apply_low_vram_mode
+        apply_low_vram_mode(
+            model,
+            mode=low_vram_mode,
+            enable_checkpointing=low_vram_grad_checkpoint,
+        )
+        torch.cuda.empty_cache()
 
     return model, config
