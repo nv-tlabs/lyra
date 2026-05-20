@@ -466,13 +466,28 @@ def _save_video_mp4(video_path: str, frames_thwc: np.ndarray, fps: float) -> Non
         frames_uint8 = np.clip(frames_uint8, 0, 255).astype(np.uint8)
     frames_list = [frame for frame in frames_uint8]
     clip = ImageSequenceClip(frames_list, fps=float(max(fps, 1.0)))
+    # Encode with HEVC (libx265) by default. AV1-MV-Fidelity (arXiv:2510.17427)
+    # shows HEVC MVs at ~3-5 px EPE vs libx264's 5-8 px when the output is
+    # consumed by downstream motion-vector tools. AV1 (libsvtav1) is even
+    # better (2-4 px EPE) but the encoder is ~5x slower; HEVC is the practical
+    # default. Users who don't need MV-quality output can override via env var.
+    codec = os.environ.get("LYRA2_OUTPUT_CODEC", "libx265")
+    if codec == "libx264":
+        ff_params = ["-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p"]
+    elif codec == "libx265":
+        ff_params = ["-crf", "20", "-preset", "slow", "-pix_fmt", "yuv420p",
+                     "-tag:v", "hvc1"]
+    elif codec == "libsvtav1":
+        ff_params = ["-crf", "30", "-preset", "6", "-pix_fmt", "yuv420p"]
+    else:
+        ff_params = ["-crf", "20", "-pix_fmt", "yuv420p"]
     try:
         clip.write_videofile(
             video_path,
-            codec="libx264",
+            codec=codec,
             audio=False,
             fps=float(max(fps, 1.0)),
-            ffmpeg_params=["-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p"],
+            ffmpeg_params=ff_params,
         )
     finally:
         clip.close()
