@@ -175,6 +175,150 @@ def canonical_rgb_to_world(
     return quantized_to_world(canonical_rgb, world_min, world_max, bits_per_axis)
 
 
+# ─── Occupancy bitmap — same-grid 1-bit-per-voxel empty/full toggle ───────
+
+
+class OccupancyBitmap:
+    """Same-resolution 1-bit-per-voxel companion to the canonical-coord atlas.
+
+    Stores one bit per voxel answering "is this slot populated?". Lets the
+    cross-attention or shader skip the multi-byte main-atlas read for empty
+    voxels via a single-bit test that's 24-32x cheaper in storage *and*
+    bandwidth.
+
+    Memory math:
+
+      Grid       Voxels      RGBA8 atlas    RGB only    1-bit mask    Ratio
+      256-cubed  16.7M       67 MB          50 MB       2.1 MB        24x
+      512-cubed  134M        537 MB         403 MB      16.8 MB       24x
+      1024-cubed 1.07B       4.3 GB         3.2 GB      134 MB        24x
+
+    Layout: 8 voxels packed per byte along the X axis of the 2D atlas
+    (preserves cache locality for horizontal-scan access patterns).
+
+    For Lyra 2 specifically, this pairs with the canonical-coord encoding
+    from _build_canonical_world_coords as the explicit emptiness signal —
+    the cross-attention doesn't have to learn that (0, 0, 0) is special;
+    a dedicated 1-bit channel says so structurally.
+
+    >>> bmap = OccupancyBitmap(atlas_w=64, atlas_h=64)
+    >>> bmap.nbytes
+    512
+    >>> bmap.get(0, 0)
+    False
+    >>> bmap.set(0, 0)
+    >>> bmap.get(0, 0)
+    True
+    >>> bmap.count_occupied()
+    1
+    """
+
+    def __init__(self, atlas_w: int = 4096, atlas_h: int = 4096):
+        if atlas_w % 8 != 0:
+            raise ValueError(
+                f"atlas_w must be divisible by 8 for X-axis bit-packing, got {atlas_w}"
+            )
+        self.atlas_w = atlas_w
+        self.atlas_h = atlas_h
+        # NumPy is fine here — this is a CPU-side build-time data structure;
+        # the GPU consumes the resulting bytes as a R8UI texture sampled via
+        # texelFetch + shift + AND. See module docstring for the GLSL pattern.
+        import numpy as np
+        self._np = np
+        self.bits = np.zeros((atlas_h, atlas_w // 8), dtype=np.uint8)
+
+    def __repr__(self) -> str:
+        n = self.count_occupied()
+        total = self.atlas_w * self.atlas_h
+        pct = (100.0 * n / total) if total > 0 else 0.0
+        return (f"OccupancyBitmap({self.atlas_w}x{self.atlas_h}, "
+                f"{self.nbytes / 1024:.1f} KB, {n}/{total} occupied = {pct:.3f}%)")
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes used by the bitmap."""
+        return int(self.bits.nbytes)
+
+    def set(self, atlas_x: int, atlas_y: int, occupied: bool = True) -> None:
+        """Set / clear the bit at (atlas_x, atlas_y)."""
+        byte_idx = atlas_x >> 3
+        bit_idx = atlas_x & 7
+        if occupied:
+            self.bits[atlas_y, byte_idx] |= self._np.uint8(1 << bit_idx)
+        else:
+            self.bits[atlas_y, byte_idx] &= self._np.uint8(~(1 << bit_idx) & 0xFF)
+
+    def get(self, atlas_x: int, atlas_y: int) -> bool:
+        """Read the bit at (atlas_x, atlas_y)."""
+        byte_idx = atlas_x >> 3
+        bit_idx = atlas_x & 7
+        return bool((self.bits[atlas_y, byte_idx] >> bit_idx) & 1)
+
+    def count_occupied(self) -> int:
+        """Total number of bits set across the whole bitmap."""
+        return int(self._np.unpackbits(self.bits).sum())
+
+    def occupancy_fraction(self) -> float:
+        """Fraction of voxels populated, in [0, 1]."""
+        total = self.atlas_w * self.atlas_h
+        return self.count_occupied() / total if total > 0 else 0.0
+
+    def fill_from_voxel_iter(self, voxels, res: int = 256,
+                              tiles_per_row: int = 16) -> int:
+        """Bulk-set occupancy from any iterable of (u, v, w) tuples.
+
+        Vectorised via numpy bitwise_or.at. Returns the count of voxels written.
+        """
+        np = self._np
+        voxels = list(voxels)
+        if not voxels:
+            return 0
+        coords = np.asarray(voxels, dtype=np.int64)
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(
+                f"Expected list of (u, v, w) triples; got shape {coords.shape}"
+            )
+        u = coords[:, 0]
+        v = coords[:, 1]
+        w_ = coords[:, 2]
+        # Pure-numpy version of voxel_to_atlas (no torch needed at build time).
+        ax = (w_ % tiles_per_row) * res + u
+        ay = (w_ // tiles_per_row) * res + v
+        byte_idx = ax >> 3
+        bit_mask = (1 << (ax & 7)).astype(np.uint8)
+        np.bitwise_or.at(self.bits, (ay, byte_idx), bit_mask)
+        return len(voxels)
+
+    def to_bytes(self) -> bytes:
+        """Raw byte buffer in row-major order."""
+        return self.bits.tobytes()
+
+    @classmethod
+    def from_bytes(cls, data: bytes, atlas_w: int = 4096,
+                    atlas_h: int = 4096) -> "OccupancyBitmap":
+        """Reconstruct from to_bytes() output."""
+        import numpy as np
+        expected = atlas_h * (atlas_w // 8)
+        if len(data) != expected:
+            raise ValueError(
+                f"Byte length {len(data)} does not match expected {expected} "
+                f"for {atlas_w}x{atlas_h} atlas"
+            )
+        out = cls(atlas_w, atlas_h)
+        out.bits = np.frombuffer(data, dtype=np.uint8).reshape(
+            (atlas_h, atlas_w // 8)
+        ).copy()
+        return out
+
+    def as_torch_tensor(self) -> "torch.Tensor":
+        """Return as a torch uint8 tensor for GPU upload.
+
+        Suitable for binding to a R8UI texture. The GLSL fetch pattern is in
+        the module docstring.
+        """
+        return torch.from_numpy(self.bits)
+
+
 # ─── Self-test ────────────────────────────────────────────────────────────
 
 
@@ -197,5 +341,29 @@ if __name__ == "__main__":
     import doctest
     failures, tests = doctest.testmod(verbose=False)
     print(f"doctest: {tests - failures}/{tests} passed")
-    print("Exhaustive bijection check (64³ pairs)...", end=" ", flush=True)
+    print("Exhaustive bijection check (64-cubed pairs)...", end=" ", flush=True)
     print("OK" if verify_bijection(res=64, tiles_per_row=8) else "FAILED")
+
+    print("\nOccupancyBitmap self-test:")
+    bmap = OccupancyBitmap(atlas_w=512, atlas_h=512)  # 64-cubed grid
+    print(f"  empty: {bmap!r}")
+    # Set a few voxels via bulk-fill
+    test_voxels = [(0, 0, 0), (1, 1, 1), (63, 63, 63), (32, 16, 8)]
+    n = bmap.fill_from_voxel_iter(test_voxels, res=64, tiles_per_row=8)
+    print(f"  after fill_from_voxel_iter({n} voxels): {bmap!r}")
+    # Verify each voxel reads back
+    res = 64
+    tiles_per_row = 8
+    ok = True
+    for (u, v, w) in test_voxels:
+        ax = (w % tiles_per_row) * res + u
+        ay = (w // tiles_per_row) * res + v
+        if not bmap.get(ax, ay):
+            ok = False
+            print(f"    FAIL: voxel ({u}, {v}, {w}) not set")
+    print(f"  round-trip: {'OK' if ok else 'FAILED'}")
+    # Bytes round-trip
+    raw = bmap.to_bytes()
+    reconstructed = OccupancyBitmap.from_bytes(raw, atlas_w=512, atlas_h=512)
+    same = (reconstructed.bits == bmap.bits).all()
+    print(f"  to_bytes / from_bytes: {'OK' if same else 'FAILED'}")
