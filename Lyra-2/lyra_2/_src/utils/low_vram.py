@@ -125,14 +125,23 @@ def apply_int8_quantization(
                     has_fp16_weights=False,
                     threshold=6.0,  # standard outlier threshold
                 )
+                # Route weight to GPU during quantization. Works whether
+                # the source Linear was on CPU (low_vram CPU-first path)
+                # or already on GPU.
+                src_dev = child.weight.device
+                target_dev = torch.device("cuda") if src_dev.type == "cpu" else src_dev
                 new.weight = bnb.nn.Int8Params(
                     child.weight.data.to(torch.float16),
                     requires_grad=False,
                     has_fp16_weights=False,
-                ).cuda(child.weight.device)
+                ).cuda(target_dev)
                 if child.bias is not None:
-                    new.bias = nn.Parameter(child.bias.data.to(torch.float16))
+                    bias_data = child.bias.data.to(torch.float16)
+                    new.bias = nn.Parameter(bias_data.to(target_dev))
                 setattr(parent, child_name, new)
+                # Release the original CPU/GPU weight tensor immediately
+                # so RAM/VRAM doesn't balloon while we walk the model.
+                del child
                 n_swapped += 1
             else:
                 _swap(child, full)
@@ -192,14 +201,18 @@ def apply_int4_quantization(
                     quant_type="nf4",        # NormalFloat-4, best fit for transformers
                     quant_storage=torch.uint8,
                 )
+                src_dev = child.weight.device
+                target_dev = torch.device("cuda") if src_dev.type == "cpu" else src_dev
                 new.weight = bnb.nn.Params4bit(
                     child.weight.data,
                     requires_grad=False,
                     quant_type="nf4",
-                ).cuda(child.weight.device)
+                ).cuda(target_dev)
                 if child.bias is not None:
-                    new.bias = nn.Parameter(child.bias.data.to(torch.bfloat16))
+                    bias_data = child.bias.data.to(torch.bfloat16)
+                    new.bias = nn.Parameter(bias_data.to(target_dev))
                 setattr(parent, child_name, new)
+                del child
                 n_swapped += 1
             else:
                 _swap(child, full)

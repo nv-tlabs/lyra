@@ -179,25 +179,39 @@ def canonical_rgb_to_world(
 
 
 class OccupancyBitmap:
-    """Same-resolution 1-bit-per-voxel companion to the canonical-coord atlas.
+    """Same-resolution 1- or 2-bit-per-voxel companion to the canonical-coord atlas.
 
-    Stores one bit per voxel answering "is this slot populated?". Lets the
-    cross-attention or shader skip the multi-byte main-atlas read for empty
-    voxels via a single-bit test that's 24-32x cheaper in storage *and*
-    bandwidth.
+    Two modes:
+
+      bits_per_voxel=1  (default; "occupancy only"):
+        One bit per voxel answering "is this slot populated?".
+        Layout: 8 voxels packed per byte along the X axis of the 2D atlas.
+        For 4096x4096 atlas = 2 MB total.
+
+      bits_per_voxel=2  ("occupancy + ray-touched"; MiLO 2026-05-20):
+        Two bits per voxel. bit 0 = occupancy, bit 1 = touched-this-frame.
+        Layout: 4 voxels packed per byte along the X axis.
+        For 4096x4096 atlas = 4 MB total.
+
+        The "touched" bit is set by the runtime raymarcher each frame
+        (via image-store atomic-or in the fragment / compute shader),
+        cleared via clear_touched() at frame start, and OR-reduced to
+        chunk granularity via touched_chunks() to drive streaming decisions.
+
+        This is the on-GPU side of demand-driven sparse voxel streaming
+        (UE5 Nanite pattern, applied to voxels): the renderer announces
+        which voxels actually contributed to a pixel; the streamer keeps
+        their chunks resident.
 
     Memory math:
 
-      Grid       Voxels      RGBA8 atlas    RGB only    1-bit mask    Ratio
-      256-cubed  16.7M       67 MB          50 MB       2.1 MB        24x
-      512-cubed  134M        537 MB         403 MB      16.8 MB       24x
-      1024-cubed 1.07B       4.3 GB         3.2 GB      134 MB        24x
-
-    Layout: 8 voxels packed per byte along the X axis of the 2D atlas
-    (preserves cache locality for horizontal-scan access patterns).
+      Grid       Voxels      RGBA8 atlas    RGB only    1-bit mask    2-bit mask
+      256-cubed  16.7M       67 MB          50 MB       2.1 MB        4.2 MB
+      512-cubed  134M        537 MB         403 MB      16.8 MB       33.6 MB
+      1024-cubed 1.07B       4.3 GB         3.2 GB      134 MB        268 MB
 
     For Lyra 2 specifically, this pairs with the canonical-coord encoding
-    from _build_canonical_world_coords as the explicit emptiness signal —
+    from _build_canonical_world_coords as the explicit emptiness signal --
     the cross-attention doesn't have to learn that (0, 0, 0) is special;
     a dedicated 1-bit channel says so structurally.
 
@@ -211,64 +225,172 @@ class OccupancyBitmap:
     True
     >>> bmap.count_occupied()
     1
+
+    >>> bmap2 = OccupancyBitmap(atlas_w=64, atlas_h=64, bits_per_voxel=2)
+    >>> bmap2.nbytes
+    1024
+    >>> bmap2.set(5, 3)        # occupy voxel
+    >>> bmap2.set_touched(5, 3)  # raymarch hit
+    >>> bmap2.get(5, 3), bmap2.get_touched(5, 3)
+    (True, True)
+    >>> bmap2.clear_touched()
+    >>> bmap2.get(5, 3), bmap2.get_touched(5, 3)
+    (True, False)
     """
 
-    def __init__(self, atlas_w: int = 4096, atlas_h: int = 4096):
-        if atlas_w % 8 != 0:
+    def __init__(self, atlas_w: int = 4096, atlas_h: int = 4096,
+                 bits_per_voxel: int = 1):
+        if bits_per_voxel not in (1, 2):
+            raise ValueError(f"bits_per_voxel must be 1 or 2, got {bits_per_voxel}")
+        voxels_per_byte = 8 // bits_per_voxel
+        if atlas_w % voxels_per_byte != 0:
             raise ValueError(
-                f"atlas_w must be divisible by 8 for X-axis bit-packing, got {atlas_w}"
+                f"atlas_w ({atlas_w}) must be divisible by {voxels_per_byte} "
+                f"for X-axis packing at bits_per_voxel={bits_per_voxel}"
             )
         self.atlas_w = atlas_w
         self.atlas_h = atlas_h
-        # NumPy is fine here — this is a CPU-side build-time data structure;
+        self.bits_per_voxel = bits_per_voxel
+        self._voxels_per_byte = voxels_per_byte
+        # NumPy is fine here -- this is a CPU-side build-time data structure;
         # the GPU consumes the resulting bytes as a R8UI texture sampled via
-        # texelFetch + shift + AND. See module docstring for the GLSL pattern.
+        # texelFetch + shift + AND.
         import numpy as np
         self._np = np
-        self.bits = np.zeros((atlas_h, atlas_w // 8), dtype=np.uint8)
+        self.bits = np.zeros((atlas_h, atlas_w // voxels_per_byte), dtype=np.uint8)
 
     def __repr__(self) -> str:
         n = self.count_occupied()
         total = self.atlas_w * self.atlas_h
         pct = (100.0 * n / total) if total > 0 else 0.0
+        mode = "occ" if self.bits_per_voxel == 1 else "occ+touch"
         return (f"OccupancyBitmap({self.atlas_w}x{self.atlas_h}, "
-                f"{self.nbytes / 1024:.1f} KB, {n}/{total} occupied = {pct:.3f}%)")
+                f"{mode}, {self.nbytes / 1024:.1f} KB, "
+                f"{n}/{total} occupied = {pct:.3f}%)")
 
     @property
     def nbytes(self) -> int:
         """Total bytes used by the bitmap."""
         return int(self.bits.nbytes)
 
+    # ---- bit indexing helpers (handle both 1- and 2-bit modes) ----
+
+    def _occ_byte_bit(self, atlas_x: int) -> tuple:
+        """Return (byte_index, bit_index) for the occupancy bit at atlas_x."""
+        if self.bits_per_voxel == 1:
+            return (atlas_x >> 3, atlas_x & 7)
+        # 2-bit mode: voxel n occupies bits (n*2) and (n*2+1) within byte (n//4).
+        return (atlas_x >> 2, (atlas_x & 3) * 2)
+
+    def _touch_byte_bit(self, atlas_x: int) -> tuple:
+        """Return (byte_index, bit_index) for the touched bit at atlas_x. 2-bit mode only."""
+        if self.bits_per_voxel != 2:
+            raise RuntimeError("touched bit only exists in 2-bit mode")
+        return (atlas_x >> 2, (atlas_x & 3) * 2 + 1)
+
+    # ---- occupancy API (works in both modes) ----
+
     def set(self, atlas_x: int, atlas_y: int, occupied: bool = True) -> None:
-        """Set / clear the bit at (atlas_x, atlas_y)."""
-        byte_idx = atlas_x >> 3
-        bit_idx = atlas_x & 7
+        """Set / clear the occupancy bit at (atlas_x, atlas_y)."""
+        byte_idx, bit_idx = self._occ_byte_bit(atlas_x)
         if occupied:
             self.bits[atlas_y, byte_idx] |= self._np.uint8(1 << bit_idx)
         else:
             self.bits[atlas_y, byte_idx] &= self._np.uint8(~(1 << bit_idx) & 0xFF)
 
     def get(self, atlas_x: int, atlas_y: int) -> bool:
-        """Read the bit at (atlas_x, atlas_y)."""
-        byte_idx = atlas_x >> 3
-        bit_idx = atlas_x & 7
+        """Read the occupancy bit at (atlas_x, atlas_y)."""
+        byte_idx, bit_idx = self._occ_byte_bit(atlas_x)
         return bool((self.bits[atlas_y, byte_idx] >> bit_idx) & 1)
 
     def count_occupied(self) -> int:
-        """Total number of bits set across the whole bitmap."""
-        return int(self._np.unpackbits(self.bits).sum())
+        """Total number of occupancy bits set across the whole bitmap."""
+        if self.bits_per_voxel == 1:
+            return int(self._np.unpackbits(self.bits).sum())
+        # 2-bit mode: count every other bit (positions 0, 2, 4, 6 in each byte)
+        occ_mask = self._np.uint8(0b01010101)
+        return int(self._np.unpackbits(self.bits & occ_mask).sum())
 
     def occupancy_fraction(self) -> float:
         """Fraction of voxels populated, in [0, 1]."""
         total = self.atlas_w * self.atlas_h
         return self.count_occupied() / total if total > 0 else 0.0
 
+    # ---- touched API (2-bit mode only) ----
+
+    def set_touched(self, atlas_x: int, atlas_y: int, touched: bool = True) -> None:
+        """Mark a voxel as touched by a ray this frame. Requires 2-bit mode."""
+        byte_idx, bit_idx = self._touch_byte_bit(atlas_x)
+        if touched:
+            self.bits[atlas_y, byte_idx] |= self._np.uint8(1 << bit_idx)
+        else:
+            self.bits[atlas_y, byte_idx] &= self._np.uint8(~(1 << bit_idx) & 0xFF)
+
+    def get_touched(self, atlas_x: int, atlas_y: int) -> bool:
+        """Read the touched bit at (atlas_x, atlas_y). Requires 2-bit mode."""
+        byte_idx, bit_idx = self._touch_byte_bit(atlas_x)
+        return bool((self.bits[atlas_y, byte_idx] >> bit_idx) & 1)
+
+    def clear_touched(self) -> None:
+        """Reset all touched bits to 0. Call at the start of each frame.
+
+        Implemented as a masked AND -- leaves occupancy bits untouched.
+        For 4096x4096 atlas this is a 4 MB memset-style op, ~tens of microseconds.
+        """
+        if self.bits_per_voxel != 2:
+            raise RuntimeError("clear_touched requires 2-bit mode")
+        # Keep only the occupancy bits (positions 0,2,4,6) -- AND with 0b01010101
+        occ_only_mask = self._np.uint8(0b01010101)
+        self.bits &= occ_only_mask
+
+    def count_touched(self) -> int:
+        """Total number of touched bits set. Requires 2-bit mode."""
+        if self.bits_per_voxel != 2:
+            raise RuntimeError("count_touched requires 2-bit mode")
+        touch_mask = self._np.uint8(0b10101010)
+        return int(self._np.unpackbits(self.bits & touch_mask).sum())
+
+    def touched_chunks(self, chunk_size: int = 16, res: int = 256,
+                       tiles_per_row: int = 16) -> "set":
+        """OR-reduce the per-voxel touched bits to per-chunk (cx, cy, cz) keys.
+
+        Drives the streamer: returns the set of chunks that the raymarcher
+        touched this frame, hence must remain resident in VRAM. Chunks not
+        in the returned set can be evicted (with hysteresis) on next eviction
+        pass.
+        """
+        if self.bits_per_voxel != 2:
+            raise RuntimeError("touched_chunks requires 2-bit mode")
+        np = self._np
+        # Unpack into per-voxel bools (full atlas_h x atlas_w array, no padding)
+        bytes_per_row = self.atlas_w // 4
+        unpacked = np.unpackbits(self.bits.reshape(-1)).reshape(self.atlas_h, bytes_per_row * 8)
+        # Take every other bit (touch positions are 1, 3, 5, 7 within each byte)
+        # numpy unpacks MSB-first so we want indices 6, 4, 2, 0 ... offset by 1 (touch)
+        # Easier: just compute from the original packed data with shift.
+        touch_flat = ((self.bits & 0b10101010) >> 1).reshape(-1)
+        # Now each byte holds up to 4 touch bits at positions 0,2,4,6 -- unpack to per-voxel bools
+        touched_voxels_per_row = np.unpackbits(touch_flat).reshape(self.atlas_h, -1)[:, :self.atlas_w]
+        # Walk the atlas: for each (ax, ay), back-derive (u, v, w) via the inverse of voxel_to_atlas
+        ys, xs = np.where(touched_voxels_per_row)
+        if len(xs) == 0:
+            return set()
+        tile_col = xs // res
+        tile_row = ys // res
+        u = xs % res
+        v = ys % res
+        w = tile_row * tiles_per_row + tile_col
+        cx = u // chunk_size
+        cy = v // chunk_size
+        cz = w // chunk_size
+        chunk_keys = set(zip(cx.tolist(), cy.tolist(), cz.tolist()))
+        return chunk_keys
+
+    # ---- bulk fill, IO, GPU upload (work in both modes) ----
+
     def fill_from_voxel_iter(self, voxels, res: int = 256,
                               tiles_per_row: int = 16) -> int:
-        """Bulk-set occupancy from any iterable of (u, v, w) tuples.
-
-        Vectorised via numpy bitwise_or.at. Returns the count of voxels written.
-        """
+        """Bulk-set occupancy from any iterable of (u, v, w) tuples."""
         np = self._np
         voxels = list(voxels)
         if not voxels:
@@ -281,11 +403,15 @@ class OccupancyBitmap:
         u = coords[:, 0]
         v = coords[:, 1]
         w_ = coords[:, 2]
-        # Pure-numpy version of voxel_to_atlas (no torch needed at build time).
         ax = (w_ % tiles_per_row) * res + u
         ay = (w_ // tiles_per_row) * res + v
-        byte_idx = ax >> 3
-        bit_mask = (1 << (ax & 7)).astype(np.uint8)
+        if self.bits_per_voxel == 1:
+            byte_idx = ax >> 3
+            bit_mask = (1 << (ax & 7)).astype(np.uint8)
+        else:
+            byte_idx = ax >> 2
+            # Bit 0 of each voxel-pair is occupancy (positions 0, 2, 4, 6)
+            bit_mask = (1 << ((ax & 3) * 2)).astype(np.uint8)
         np.bitwise_or.at(self.bits, (ay, byte_idx), bit_mask)
         return len(voxels)
 
@@ -295,26 +421,28 @@ class OccupancyBitmap:
 
     @classmethod
     def from_bytes(cls, data: bytes, atlas_w: int = 4096,
-                    atlas_h: int = 4096) -> "OccupancyBitmap":
+                    atlas_h: int = 4096, bits_per_voxel: int = 1) -> "OccupancyBitmap":
         """Reconstruct from to_bytes() output."""
         import numpy as np
-        expected = atlas_h * (atlas_w // 8)
+        voxels_per_byte = 8 // bits_per_voxel
+        expected = atlas_h * (atlas_w // voxels_per_byte)
         if len(data) != expected:
             raise ValueError(
                 f"Byte length {len(data)} does not match expected {expected} "
-                f"for {atlas_w}x{atlas_h} atlas"
+                f"for {atlas_w}x{atlas_h} atlas at bits_per_voxel={bits_per_voxel}"
             )
-        out = cls(atlas_w, atlas_h)
+        out = cls(atlas_w, atlas_h, bits_per_voxel=bits_per_voxel)
         out.bits = np.frombuffer(data, dtype=np.uint8).reshape(
-            (atlas_h, atlas_w // 8)
+            (atlas_h, atlas_w // voxels_per_byte)
         ).copy()
         return out
 
     def as_torch_tensor(self) -> "torch.Tensor":
         """Return as a torch uint8 tensor for GPU upload.
 
-        Suitable for binding to a R8UI texture. The GLSL fetch pattern is in
-        the module docstring.
+        Suitable for binding to a R8UI texture. In 2-bit mode the shader
+        extracts bit 0 (occupancy) or bit 1 (touched) of the voxel's slot
+        within the byte.
         """
         return torch.from_numpy(self.bits)
 
