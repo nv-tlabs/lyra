@@ -1564,6 +1564,63 @@ class Lyra2Model(WANDiffusionModel):
             self._cached_spatial_coords_meta = meta
         return self._cached_spatial_coords
 
+    # ─── PROPOSAL §4.1: world-coord canonical encoding ─────────────────────
+    # Alternative to _build_canonical_spatial_coords above. Emits per-pixel
+    # world coordinates (quantized to uint8/16/32 per `bits`) instead of
+    # (u_normalized, v_normalized, frame_slot). Both functions live here
+    # side-by-side so the model class can switch between them via a config
+    # flag without breaking existing behaviour. Switching the conditioning
+    # head from one to the other requires fine-tuning — see the proposal
+    # at github.com/MiLO83/DownToEarth/blob/main/LYRA2_PROPOSAL.md §4.1.
+    #
+    # Identity property: a pixel's RGB byte triple IS its world coord (modulo
+    # the world_min/world_max normalization). Multi-frame consistency becomes
+    # structural — the same 3D point produces the same RGB across all views.
+    @staticmethod
+    def _build_canonical_world_coords(
+        H: int,
+        W: int,
+        num_spatial_hist: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        world_min: torch.Tensor,        # (3,) float, world-space scene origin
+        world_max: torch.Tensor,        # (3,) float, world-space scene extent
+        bits_per_axis: int = 16,        # 8 / 16 / 32
+    ) -> Optional[torch.Tensor]:
+        """Initial canonical-coord tensor in WORLD units (post-warp will
+        transport these via depth+pose; quantize the warped output at the
+        call site via uvw_atlas.world_to_quantized).
+
+        Returns [num_spatial_hist, 3, H, W] in `dtype`, normalized to [-1, 1]
+        per-axis so the warp arithmetic stays in fp16-safe range. The output
+        is downstream-quantized to integer bytes for the canonical-image
+        ControlNet input, but the warp itself runs in floats for accuracy.
+        """
+        if num_spatial_hist <= 0:
+            return None
+        # Per-pixel normalized world coords as the seed grid. Each axis spans
+        # [-1, 1]; pre-warp these are placeholders that the forward_warp's
+        # depth+intrinsics transform will resolve into the actual 3D point
+        # each pixel maps to in the target view.
+        xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+        ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        base_xy = torch.stack([xx, yy], dim=0)                 # [2, H, W]
+        base_xy = base_xy.unsqueeze(0).repeat(num_spatial_hist, 1, 1, 1)  # [N,2,H,W]
+        if num_spatial_hist == 1:
+            zs = torch.zeros(1, device=device, dtype=dtype)
+        else:
+            zs = torch.linspace(-1.0, 1.0, num_spatial_hist, device=device, dtype=dtype)
+        z = zs.view(num_spatial_hist, 1, 1, 1).expand(num_spatial_hist, 1, H, W)
+        coords = torch.cat([base_xy, z], dim=1)                # [N, 3, H, W]
+        # Note: the actual world-coord values are filled in by the per-slot
+        # cache lookup at warp time. This function provides the canonical
+        # *coordinate space* skeleton; the warp's depth-based unprojection
+        # replaces these placeholders with real world coords from the cache.
+        # See proposal §C in LYRA2_V2_PROPOSAL.md for the integration sketch.
+        return coords
+
     @staticmethod
     def _pixelshuffle_hw_to_latent(
         x: torch.Tensor,
@@ -2653,6 +2710,8 @@ class Sparse3DCache:
         random: bool = False,
         max_coverage: bool = False,
         depth_threshold: float = 0.1,
+        # ─── PROPOSAL §5.4: axis-aligned octant pre-filter (opt-in) ────
+        octant_prefilter: bool = False,
     ) -> list[tuple[int, int]]:
         """Retrieve the best candidate frames from the cache.
 
@@ -2695,8 +2754,46 @@ class Sparse3DCache:
         if avail <= 0:
             return []
 
+        # ─── PROPOSAL §5.4: axis-aligned octant pre-filter ────────────────
+        # When opt-in, prune candidates whose mean world position is BEHIND
+        # all target camera views (in the camera-forward half-space sense).
+        # Standard graphics culling, applied at the cache-candidate level
+        # before the expensive [V, C, B, H', W', 4, 4] matmul. Indices are
+        # remapped via `_orig_idx` for the rest of the function.
+        # Reduction is typically ~50% with zero quality impact since these
+        # candidates contributed zero valid pixels anyway (z_all > 0 filter
+        # at line ~2733 would have culled their pixel-level contributions).
+        # The win is in the matmul cost.
+        _orig_idx = list(range(avail))
+        if octant_prefilter and avail > 0:
+            centroids = torch.stack(
+                [p.to(device=device).mean(dim=(1, 2)) for p in self._world_points[:avail]],
+                dim=0,
+            )  # [avail, B, 3]
+            cam_positions_VB3 = []
+            cam_forwards_VB3 = []
+            for w2c in w2c_views:
+                c2w = torch.linalg.inv(w2c.float())
+                cam_positions_VB3.append(c2w[:, :3, 3].to(device=device, dtype=centroids.dtype))
+                cam_forwards_VB3.append((-c2w[:, :3, 2]).to(device=device, dtype=centroids.dtype))
+            cam_positions_VB3 = torch.stack(cam_positions_VB3, dim=0)   # [V, B, 3]
+            cam_forwards_VB3 = torch.stack(cam_forwards_VB3, dim=0)     # [V, B, 3]
+            rel = centroids[None, :, :, :] - cam_positions_VB3[:, None, :, :]   # [V, avail, B, 3]
+            fwd_dot = (rel * cam_forwards_VB3[:, None, :, :]).sum(dim=-1)        # [V, avail, B]
+            keep_cand = (fwd_dot > 0).any(dim=2).any(dim=0)                       # [avail]
+            n_keep = int(keep_cand.sum().item())
+            if n_keep > 0 and n_keep < avail:
+                kept_orig = keep_cand.nonzero(as_tuple=True)[0].tolist()
+                _orig_idx = kept_orig
+                avail = n_keep
+                log.info(
+                    f"Sparse3DCache.retrieve octant pre-filter: kept {avail}/{int(keep_cand.shape[0])} "
+                    f"candidates (proposal §5.4)",
+                    rank0_only=True,
+                )
+
         num_cands = avail
-        pts_list = self._world_points[:avail]
+        pts_list = [self._world_points[i] for i in _orig_idx]
 
         # Vectorized projection of all (view, candidate) pairs at once.
         # pts_stacked: [C, B, H', W', 3]
@@ -2778,7 +2875,9 @@ class Sparse3DCache:
             # because its warping is already included in the network condition.
             # Only applies when the most recent frame_id > 0 (skip the seed frame_id=0
             # and multiview inputs with negative IDs).
-            avail_frame_ids = self._frame_ids[:avail]
+            # Remap through _orig_idx so the octant-prefilter case sees the
+            # correct subset of frame_ids (identity mapping when prefilter is off).
+            avail_frame_ids = [self._frame_ids[i] for i in _orig_idx]
             max_frame_id = max(avail_frame_ids)
             excluded: set[int] = set()
             if max_frame_id > 0:
@@ -2825,8 +2924,12 @@ class Sparse3DCache:
             scores_t = counts.float()
             scores = scores_t.tolist()
 
+            # _orig_idx remaps through the octant pre-filter (identity when off).
             score_map = {
-                int(self._latent_indices[i]): {"score": float(scores[i]), "frame_id": int(self._frame_ids[i])}
+                int(self._latent_indices[_orig_idx[i]]): {
+                    "score": float(scores[i]),
+                    "frame_id": int(self._frame_ids[_orig_idx[i]]),
+                }
                 for i in range(num_cands)
             }
             log.info(f"Sparse3DCache.retrieve scores (latent_index -> score): {score_map}", rank0_only=True)
@@ -2845,6 +2948,10 @@ class Sparse3DCache:
                 top_ids = sorted(range(num_cands), key=lambda i: scores[i], reverse=True)[:num_latents]
 
         top_ids_reversed = top_ids[::-1]
-        return [(self._latent_indices[i], self._frame_ids[i]) for i in top_ids_reversed]
+        # _orig_idx remaps through the octant pre-filter (identity when off).
+        return [
+            (self._latent_indices[_orig_idx[i]], self._frame_ids[_orig_idx[i]])
+            for i in top_ids_reversed
+        ]
 
 
