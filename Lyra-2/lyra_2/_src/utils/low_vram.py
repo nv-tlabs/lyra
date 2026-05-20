@@ -501,12 +501,99 @@ def requantize_checkpoint(
     )
 
 
+def _build_uvw_compat_metadata(
+    voxel_res: int = 256,
+    bits_per_axis: int = 8,
+    tiles_per_row: int = 16,
+    default_world_extent_m: float = 4.0,
+    precompute_canonical_meshes: bool = True,
+    canonical_configs: list[tuple[int, int, int]] | None = None,
+) -> dict:
+    """Build a UVW-compatibility metadata block to embed in a quantized
+    checkpoint. Travels alongside the fp8 weights so a UVW-aware runtime
+    auto-configures without per-load math.
+
+    What this is: a marker + config block. It does NOT change how the
+    model interprets inputs; that still requires the conditioning-head
+    fine-tune that mods #1 and #2 of PR #61 propose. What it DOES:
+
+      - Specifies the bijection layout (atlas dims, tile layout, byte width)
+        so a UVW-aware runtime knows which member of the byte-width
+        family this checkpoint is paired with.
+      - Carries optional pre-computed canonical-coord meshes for the
+        standard inference configs (saves a few ms per inference start).
+      - Marks the checkpoint as 'uvw_compat_version: 1' so future
+        runtimes can detect compatibility.
+
+    Stored under the '_lyra_uvw_metadata' key in the output checkpoint
+    alongside '_lyra_low_vram_metadata'. Both are harmless to non-aware
+    loaders -- they just ignore unrecognised keys.
+
+    Args:
+        voxel_res: per-axis voxel grid resolution (256 for RGBA8)
+        bits_per_axis: 8 / 16 / 32 -- which byte-width family member
+        tiles_per_row: 2D atlas tile layout (16 for 256-cubed)
+        default_world_extent_m: default world half-width in metres (4.0
+            matches voxgaussian's hamlet-scale default; scene-time overrides
+            available at inference)
+        precompute_canonical_meshes: include the canonical-coord starting
+            grid for the standard (H, W, num_spatial_hist) configurations
+        canonical_configs: list of (H, W, num_spatial_hist) tuples to
+            pre-compute. Default: [(480, 832, 5)] which matches Lyra 2's
+            documented production config.
+
+    Returns:
+        A dict suitable for storage in the checkpoint.
+    """
+    import torch
+
+    if canonical_configs is None:
+        canonical_configs = [(480, 832, 5)]   # Lyra 2's published config
+
+    metadata = {
+        "uvw_compat_version": 1,
+        "voxel_res": voxel_res,
+        "bits_per_axis": bits_per_axis,
+        "tiles_per_row": tiles_per_row,
+        "atlas_w": voxel_res * tiles_per_row,
+        "atlas_h": voxel_res * (voxel_res // tiles_per_row),
+        "default_world_extent_m": default_world_extent_m,
+        "default_world_min": [-default_world_extent_m] * 3,
+        "default_world_max": [+default_world_extent_m] * 3,
+        "occupancy_bitmap_bytes": (voxel_res * tiles_per_row) * (voxel_res * (voxel_res // tiles_per_row)) // 8,
+        "summary_atlas_bytes": (voxel_res * tiles_per_row) * (voxel_res * (voxel_res // tiles_per_row)) * 4,  # RGBA8
+        "downtoearth_bijection_url": "https://github.com/MiLO83/DownToEarth/blob/main/voxgaussian/pipeline/uvw_atlas.py",
+    }
+
+    if precompute_canonical_meshes:
+        meshes = {}
+        for H, W, N in canonical_configs:
+            # Reproduce _build_canonical_spatial_coords' output once at bake
+            # time. Stored as fp16 to keep the size down; can be cast back
+            # to whatever precision the runtime needs.
+            xs = torch.linspace(-1.0, 1.0, W, dtype=torch.float32)
+            ys = torch.linspace(-1.0, 1.0, H, dtype=torch.float32)
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+            base_xy = torch.stack([xx, yy], dim=0).unsqueeze(0).repeat(N, 1, 1, 1)
+            if N == 1:
+                zs = torch.zeros(1, dtype=torch.float32)
+            else:
+                zs = torch.linspace(-1.0, 1.0, N, dtype=torch.float32)
+            z = zs.view(N, 1, 1, 1).expand(N, 1, H, W)
+            coords = torch.cat([base_xy, z], dim=1).to(torch.float16)
+            meshes[f"{H}x{W}x{N}"] = coords
+        metadata["precomputed_canonical_meshes"] = meshes
+
+    return metadata
+
+
 def requantize_streaming(
     input_path: str,
     output_path: str,
     mode: QuantMode = "fp8",
     skip_modules: list[str] | None = None,
     progress: bool = True,
+    bake_uvw_metadata: bool = True,
 ) -> None:
     """Streaming requantization: cast weights tensor-by-tensor at the
     state_dict level, no full-model load required. Runs on any machine
@@ -641,6 +728,13 @@ def requantize_streaming(
         "state_dict": new_sd,
         "_lyra_low_vram_metadata": metadata,
     }
+    # Bake UVW bijection metadata + pre-computed canonical meshes alongside.
+    # A UVW-aware runtime auto-configures from this block; older loaders
+    # ignore the unrecognised key.
+    if bake_uvw_metadata:
+        output["_lyra_uvw_metadata"] = _build_uvw_compat_metadata()
+        print(f"[requantize-streaming] baked UVW compat metadata "
+              f"(version 1, atlas 4096x4096, voxel-res 256, 8 bits/axis)")
     # Preserve any other top-level keys from the original (config, optim, etc.)
     if outer is not None:
         for k, v in outer.items():
@@ -742,6 +836,12 @@ if __name__ == "__main__":
         "--no-progress", action="store_true",
         help="Suppress per-100-tensor progress lines",
     )
+    rqs.add_argument(
+        "--no-bake-uvw", action="store_true",
+        help="Skip embedding UVW bijection compat metadata + pre-computed "
+             "canonical-coord meshes (saves ~few KB but defeats the "
+             "UVW-aware runtime auto-config). Default: bake the metadata.",
+    )
 
     inspect = sub.add_parser("inspect", help="Print quantization metadata of a checkpoint")
     inspect.add_argument("checkpoint", help="Path to .pth checkpoint")
@@ -754,7 +854,27 @@ if __name__ == "__main__":
             args.input, args.output, mode=args.mode,
             skip_modules=args.skip,
             progress=not args.no_progress,
+            bake_uvw_metadata=not args.no_bake_uvw,
         )
     elif args.command == "inspect":
         mode = detect_checkpoint_quantization(args.checkpoint)
         print(f"Checkpoint quantization: {mode}")
+        # Also surface UVW compat metadata if present
+        try:
+            from lyra_2._ext.imaginaire.utils.easy_io import easy_io
+            data = easy_io.load(args.checkpoint, map_location="cpu")
+            if isinstance(data, dict) and "_lyra_uvw_metadata" in data:
+                uvw = data["_lyra_uvw_metadata"]
+                print(f"UVW compat version:      {uvw.get('uvw_compat_version', '?')}")
+                print(f"  voxel resolution:      {uvw.get('voxel_res')}^3")
+                print(f"  bits per axis:         {uvw.get('bits_per_axis')}")
+                print(f"  atlas dims:            {uvw.get('atlas_w')}x{uvw.get('atlas_h')}")
+                print(f"  occupancy bitmap:      {uvw.get('occupancy_bitmap_bytes', 0) / 1024:.1f} KB")
+                print(f"  summary atlas (rgba8): {uvw.get('summary_atlas_bytes', 0) / 1024 / 1024:.1f} MB")
+                meshes = uvw.get("precomputed_canonical_meshes", {})
+                if meshes:
+                    print(f"  pre-computed meshes:   {list(meshes.keys())}")
+            else:
+                print("UVW compat: (no metadata baked in)")
+        except Exception as e:
+            print(f"UVW compat: (could not read -- {e})")
