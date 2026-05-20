@@ -316,10 +316,36 @@ class OccupancyBitmap:
         total = self.atlas_w * self.atlas_h
         return self.count_occupied() / total if total > 0 else 0.0
 
-    # ---- touched API (2-bit mode only) ----
+    # ---- voxel-coord convenience helpers (bijection-keyed) ----
+    #
+    # These wrap set/get with an explicit voxel_to_atlas call so the
+    # UVW <-> RGB <-> XYZ bidirectional bijection is the canonical
+    # lookup mechanism. Callers think in voxel grid coordinates (u, v, w)
+    # and never touch atlas-space directly. The render-flag bit ends up
+    # at the same atlas address as the voxel's RGBA data, which means
+    # one bijection lookup serves both read (color) and write (flag).
+
+    def set_by_voxel(self, u: int, v: int, w: int, occupied: bool = True,
+                     res: int = 256, tiles_per_row: int = 16) -> None:
+        """Set occupancy at voxel coord (u, v, w) via the UVW bijection."""
+        ax = (w % tiles_per_row) * res + u
+        ay = (w // tiles_per_row) * res + v
+        self.set(ax, ay, occupied)
+
+    def get_by_voxel(self, u: int, v: int, w: int,
+                     res: int = 256, tiles_per_row: int = 16) -> bool:
+        """Read occupancy at voxel coord (u, v, w) via the UVW bijection."""
+        ax = (w % tiles_per_row) * res + u
+        ay = (w // tiles_per_row) * res + v
+        return self.get(ax, ay)
+
+    # ---- touched / render-flag API (2-bit mode only) ----
 
     def set_touched(self, atlas_x: int, atlas_y: int, touched: bool = True) -> None:
-        """Mark a voxel as touched by a ray this frame. Requires 2-bit mode."""
+        """Mark a voxel as touched by a ray this frame. Requires 2-bit mode.
+
+        Atlas-coord form. For voxel-coord form see set_touched_by_voxel.
+        """
         byte_idx, bit_idx = self._touch_byte_bit(atlas_x)
         if touched:
             self.bits[atlas_y, byte_idx] |= self._np.uint8(1 << bit_idx)
@@ -330,6 +356,26 @@ class OccupancyBitmap:
         """Read the touched bit at (atlas_x, atlas_y). Requires 2-bit mode."""
         byte_idx, bit_idx = self._touch_byte_bit(atlas_x)
         return bool((self.bits[atlas_y, byte_idx] >> bit_idx) & 1)
+
+    def set_touched_by_voxel(self, u: int, v: int, w: int, touched: bool = True,
+                              res: int = 256, tiles_per_row: int = 16) -> None:
+        """Set the render-flag for voxel (u, v, w) via the UVW bijection.
+
+        This is the canonical API for the runtime raymarcher: one
+        voxel_to_atlas lookup serves both the RGBA read (the voxel's
+        color, sampled from the main atlas) and the flag write (this
+        bitmap), because they share the same atlas address space.
+        """
+        ax = (w % tiles_per_row) * res + u
+        ay = (w // tiles_per_row) * res + v
+        self.set_touched(ax, ay, touched)
+
+    def get_touched_by_voxel(self, u: int, v: int, w: int,
+                              res: int = 256, tiles_per_row: int = 16) -> bool:
+        """Read the render-flag for voxel (u, v, w) via the UVW bijection."""
+        ax = (w % tiles_per_row) * res + u
+        ay = (w // tiles_per_row) * res + v
+        return self.get_touched(ax, ay)
 
     def clear_touched(self) -> None:
         """Reset all touched bits to 0. Call at the start of each frame.
