@@ -37,6 +37,11 @@ def load_model_from_checkpoint(
     seed=0,
     experiment_opts: list[str] = [],
     strict=True,
+    # Optional consumer-GPU memory reduction. See lyra_2/_src/utils/low_vram.py
+    # for the full set of options. Defaults preserve existing behaviour
+    # (bf16 model, no quantization).
+    low_vram_mode: str = "none",                  # 'none' | 'int8' | 'int4' | 'fp8'
+    low_vram_grad_checkpoint: bool = False,
 ):
     """
     experiment_name: experiment name
@@ -44,6 +49,11 @@ def load_model_from_checkpoint(
     config_file: config file path
     enable_fsdp: enable fsdp
     seed: random seed
+    low_vram_mode: opt-in weight quantization for consumer GPUs. Use 'int8'
+        on a 16 GB card (RTX 5060 Ti / 5070 / 4060 Ti 16G / etc.). See
+        lyra_2/_src/utils/low_vram.py for the precision/quality table.
+    low_vram_grad_checkpoint: pair with the above to save activation memory
+        during inference (mild speed cost).
     """
     config_module = get_config_module(config_file)
     config = importlib.import_module(config_module).make_config()
@@ -66,22 +76,29 @@ def load_model_from_checkpoint(
     if not enable_fsdp:
         # disable fsdp
         config.model.config.fsdp_shard_size = 1
+
+    # When low_vram_mode is requested we stay on CPU through instantiate +
+    # weight-load + quantize, and only .cuda() after the model has been
+    # cast to int8/int4/fp8. Otherwise the bf16 14B model peaks ~28 GB on
+    # GPU before quantization can shrink it -- OOM on 16 GB cards.
+    cpu_first = low_vram_mode != "none"
+
     with misc.timer("instantiate model"):
-        model = instantiate(config.model).cuda()
-        # Convert the model parameters to bf16
+        if cpu_first:
+            log.info(f"low_vram_mode={low_vram_mode}: instantiating on CPU first", rank0_only=True)
+            model = instantiate(config.model)
+        else:
+            model = instantiate(config.model).cuda()
         model.on_train_start()
 
     if checkpoint_path.endswith(".pth"):
         log.info(f"Loading model from consolidated checkpoint {checkpoint_path}")
-
         model.load_state_dict(easy_io.load(checkpoint_path), strict=strict)
     else:
         log.info(f"Loading model from dcp checkpoint {checkpoint_path}")
-
         checkpointer = DistributedCheckpointer(config.checkpoint, config.job, callbacks=None, disable_async=True)
         cur_key_ckpt_full_path = os.path.join(checkpoint_path, "model")
         storage_reader = checkpointer.get_storage_reader(cur_key_ckpt_full_path)
-
         _model_wrapper = ModelWrapper(model, load_ema_to_reg=load_ema_to_reg)
         _state_dict = _model_wrapper.state_dict()
         dcp.load(
@@ -93,4 +110,18 @@ def load_model_from_checkpoint(
 
     torch.cuda.empty_cache()
 
+    # Quantize (still on CPU if cpu_first), then move whole model to GPU.
+    if low_vram_mode != "none" or low_vram_grad_checkpoint:
+        from lyra_2._src.utils.low_vram import apply_low_vram_mode
+        apply_low_vram_mode(
+            model,
+            mode=low_vram_mode,
+            enable_checkpointing=low_vram_grad_checkpoint,
+        )
+
+    if cpu_first:
+        log.info("moving quantized model to GPU ...", rank0_only=True)
+        model = model.cuda()
+
+    torch.cuda.empty_cache()
     return model, config
