@@ -277,6 +277,9 @@ class Lyra2Model(WANDiffusionModel):
             if hasattr(net, "buffer_pixelshuffle"):
                 net.buffer_pixelshuffle = True
 
+            # Match the dtype used by on_train_start before materializing meta parameters.
+            net = net.to(dtype=self.precision)
+
             if self.fsdp_device_mesh:
                 net.fully_shard(mesh=self.fsdp_device_mesh, **fsdp_kwargs)
                 net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True, **fsdp_kwargs)

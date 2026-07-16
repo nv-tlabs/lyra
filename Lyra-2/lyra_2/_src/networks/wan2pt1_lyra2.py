@@ -138,14 +138,33 @@ class Lyra2AttentionBlock(nn.Module):
     def _sincos_embed(x: torch.Tensor, multires: int) -> torch.Tensor:
         if multires <= 0:
             return x
-        x_float = x.float()
-        embeds = []
-        for i in range(int(multires)):
-            freq = (2.0 ** i) * math.pi
-            embeds.append(torch.sin(x_float * freq))
-            embeds.append(torch.cos(x_float * freq))
-        out = torch.cat(embeds, dim=-1)
-        return out.type_as(x)
+        if torch.is_grad_enabled():
+            x_float = x.float()
+            embeds = []
+            for i in range(int(multires)):
+                freq = (2.0 ** i) * math.pi
+                embeds.append(torch.sin(x_float * freq))
+                embeds.append(torch.cos(x_float * freq))
+            return torch.cat(embeds, dim=-1).type_as(x)
+
+        width = int(x.shape[-1])
+        out_width = width * 2 * int(multires)
+        out = torch.empty((*x.shape[:-1], out_width), device=x.device, dtype=x.dtype)
+        x_rows = x.reshape(-1, width)
+        out_rows = out.reshape(-1, out_width)
+        row_chunk = 1024
+        for start in range(0, int(x_rows.shape[0]), row_chunk):
+            end = min(start + row_chunk, int(x_rows.shape[0]))
+            x_float = x_rows[start:end].float()
+            offset = 0
+            for i in range(int(multires)):
+                freq = (2.0 ** i) * math.pi
+                phase = x_float * freq
+                out_rows[start:end, offset : offset + width].copy_(torch.sin(phase))
+                offset += width
+                out_rows[start:end, offset : offset + width].copy_(torch.cos(phase))
+                offset += width
+        return out
 
     def forward(
         self,
@@ -791,12 +810,17 @@ class Lyra2WanModel(WeightTrainingStat):
         freqs_tokens = torch.cat(freq_chunks, dim=0)
         camera_tokens = torch.cat(cam_chunks, dim=1) if camera is not None else None
         buffer_tokens = torch.cat(buf_chunks, dim=1) if use_buffer_tokens else None
+        token_chunks.clear()
+        freq_chunks.clear()
+        cam_chunks.clear()
+        buf_chunks.clear()
 
         # When inject_kq_only is enabled, append a per-token validity indicator channel
         # (1.0 = real data, 0.0 = dummy) so the attention block can mask out
         # dummy positions after buffer encoding.
         if self.inject_kq_only and buffer_tokens is not None:
             validity_tokens = torch.cat(buf_validity_chunks, dim=1)
+            buf_validity_chunks.clear()
             buffer_tokens = torch.cat([buffer_tokens, validity_tokens], dim=-1)
 
         assert gen_start is not None and gen_end is not None

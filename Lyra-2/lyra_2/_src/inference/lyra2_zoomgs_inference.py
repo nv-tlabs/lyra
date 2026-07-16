@@ -39,6 +39,8 @@ import torch.nn.functional as F
 from lyra_2._ext.imaginaire.utils import log, misc
 from lyra_2._ext.imaginaire.visualize.video import save_img_or_video
 from lyra_2._src.inference.lyra2_ar_inference import (
+    _offload_diffusion_to_cpu,
+    _restore_diffusion_to_gpu,
     save_output,
     safe_to,
     run_lyra2_sample,
@@ -51,6 +53,27 @@ from lyra_2._src.utils.model_loader import load_model_from_checkpoint
 
 torch.enable_grad(False)
 torch.backends.cudnn.enabled = False
+
+
+def _merge_active_lora_for_inference(net) -> int:
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    merged = 0
+    with torch.no_grad():
+        for module in net.modules():
+            if isinstance(module, BaseTunerLayer) and not module.merged:
+                base_layer = module.get_base_layer()
+                if getattr(base_layer, "bias", None) is None:
+                    for adapter in module.active_adapters:
+                        if module.lora_bias.get(adapter, False) and adapter in module.lora_B:
+                            bias = module.lora_B[adapter].bias
+                            base_layer.bias = torch.nn.Parameter(
+                                torch.zeros_like(bias), requires_grad=base_layer.weight.requires_grad
+                            )
+                            break
+                module.merge()
+                merged += 1
+    return merged
 
 # ---------------------------------------------------------------------------
 # DA3 single-image depth (reused from lyra2_ar_inference_from_image)
@@ -174,6 +197,7 @@ def parse_arguments() -> argparse.Namespace:
                         default=["checkpoints/lora/realism_boost.safetensors",
                                  "checkpoints/lora/detail_enhancer.safetensors"])
     parser.add_argument("--lora_weights", type=float, nargs="+", default=[0.4, 0.4])
+    parser.add_argument("--merge_lora", action="store_true")
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--offload_when_prompt", action="store_true")
 
@@ -528,6 +552,9 @@ if __name__ == "__main__":
             lora_name = model.load_lora_weights(lora_path)
             lora_names.append(lora_name)
         model.set_weights_and_activate_adapters(lora_names, args.lora_weights)
+        if args.merge_lora:
+            merged_lora_layers = _merge_active_lora_for_inference(model.net)
+            log.info(f"Merged {merged_lora_layers} LoRA layers for low-memory inference.", rank0_only=True)
         if hasattr(model, "net") and hasattr(model.net, "enable_selective_checkpoint"):
             model.net.enable_selective_checkpoint(model.net.sac_config, model.net.blocks)
 
@@ -554,11 +581,13 @@ if __name__ == "__main__":
 
     # Load DA3 model
     from lyra_2._src.inference.depth_utils import load_da3_model
+    swap_da3_diffusion = bool(getattr(args, "offload_da3_diffusion", False))
     da3_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    da3_load_device = "cpu" if swap_da3_diffusion else da3_device
     da3_model = load_da3_model(
         da3_model_name=args.da3_model_name,
         da3_model_path_custom=args.da3_model_path_custom,
-        device=da3_device,
+        device=da3_load_device,
     )
     da3_model.eval()
 
@@ -566,7 +595,9 @@ if __name__ == "__main__":
     moge_model = None
     if args.use_moge_scale:
         from lyra_2._src.inference.depth_utils import load_moge_model
-        moge_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        moge_device = "cpu" if swap_da3_diffusion else model.tensor_kwargs.get(
+            "device", "cuda" if torch.cuda.is_available() else "cpu"
+        )
         moge_model = load_moge_model(moge_device)
         moge_model.eval()
         log.info("MoGe model loaded for depth scale alignment.", rank0_only=True)
@@ -608,12 +639,18 @@ if __name__ == "__main__":
 
         # Step 1: Depth & intrinsics
         log.info("Running DA3 single-image depth...", rank0_only=True)
+        if swap_da3_diffusion:
+            _offload_diffusion_to_cpu(model, True)
+            da3_model.to(da3_device)
         image_chw01, depth_hw, K_33, mask_hw = _da3_infer_depth_intrinsics_single(
             da3_model=da3_model,
             img_rgb_uint8=rgb_t,
             target_hw=(target_h, target_w),
         )
         H, W = image_chw01.shape[-2:]
+        if swap_da3_diffusion:
+            da3_model.cpu()
+            torch.cuda.empty_cache()
 
         # Step 1b: Optionally align DA3 depth to MoGe scale
         if args.use_moge_scale and moge_model is not None:
@@ -663,6 +700,12 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
             gc.collect()
 
+        if swap_da3_diffusion:
+            da3_model.cpu()
+            torch.cuda.empty_cache()
+            gc.collect()
+            _restore_diffusion_to_gpu(model, True)
+
         img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0  # [-1,1]
 
         # Step 2: Load caption from .txt file or use explicit prompt
@@ -690,7 +733,11 @@ if __name__ == "__main__":
         # Step 2b: T5 embeddings
         from lyra_2._src.inference.get_t5_emb import get_umt5_embedding, get_umt5_embedding_offloaded
         if args.offload_when_prompt:
-            t5 = get_umt5_embedding_offloaded(caption, device=desired_device).to(dtype=desired_dtype)
+            _offload_diffusion_to_cpu(model, True)
+            try:
+                t5 = get_umt5_embedding_offloaded(caption, device=desired_device).to(dtype=desired_dtype)
+            finally:
+                _restore_diffusion_to_gpu(model, True)
         else:
             t5 = get_umt5_embedding(caption, device=desired_device).to(dtype=desired_dtype)
         if t5.dim() == 2:

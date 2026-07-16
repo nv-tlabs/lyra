@@ -40,10 +40,24 @@ def _get_vae_handles(model):
     vae_core = vae_wrap.model   # WanVAE_ core
     return vae_iface, vae_wrap, vae_core
 
+def _offload_vae_core_to_cpu(vae_core, enable_offload: bool):
+    if enable_offload:
+        vae_core.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _restore_vae_core_to_gpu(vae_core, model, enable_offload: bool):
+    if enable_offload:
+        vae_core.to(model.tensor_kwargs.get("device", "cuda"))
+
+
+
 def _prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model=None, enable_offload=False):
     """Advance encoder cache through the history pixels and return history_latents plus the live cache."""
     # Offload diffusion model to CPU before VAE operations
     _offload_diffusion_to_cpu(model, enable_offload)
+    _restore_vae_core_to_gpu(vae_core, model, enable_offload)
 
     # Fresh encode using model helpers, then clone caches and normalize
     vae_core.clear_cache()
@@ -54,6 +68,7 @@ def _prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model=None
         history_latents = model._encoder_feats_to_normalized_latents(feats).contiguous().to(init_video.dtype)
 
     # Restore diffusion model to GPU after VAE operations
+    _offload_vae_core_to_cpu(vae_core, enable_offload)
     _restore_diffusion_to_gpu(model, enable_offload)
 
     return history_latents, enc_feat_cache
@@ -63,6 +78,7 @@ def _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, latent_chunk, l
     """Stream-decode new latent chunk given current decoder cache; return pixel frames for this chunk."""
     # Offload diffusion model to CPU before VAE operations
     _offload_diffusion_to_cpu(model, enable_offload)
+    _restore_vae_core_to_gpu(vae_core, model, enable_offload)
 
     # Unnormalize per-frame to mu using offset, then apply channel unscale, conv2, and stream through decoder
     B, C, T_new, H, W = latent_chunk.shape
@@ -91,6 +107,7 @@ def _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, latent_chunk, l
         video_chunk = torch.cat(outs, dim=2)
 
     # Restore diffusion model to GPU after VAE operations
+    _offload_vae_core_to_cpu(vae_core, enable_offload)
     _restore_diffusion_to_gpu(model, enable_offload)
 
     return video_chunk
@@ -711,6 +728,8 @@ class Lyra2InferencePipeline:
 
         cfg = self.model.config
         use_image_spatial = bool(cfg.spatial_memory_use_image)
+        _offload_diffusion_to_cpu(self.model, self.args.offload)
+        _restore_vae_core_to_gpu(self.vae_core, self.model, self.args.offload)
 
         # Move history latents to the model device/dtype for selection/inference.
         history_full = misc.to(self.history_latents, **self.model.tensor_kwargs)
@@ -769,8 +788,17 @@ class Lyra2InferencePipeline:
                 if int(warp_pixels.shape[1]) > 3:
                     warp_pixels = warp_pixels[:, :3]
             self.warp_video_collect.append(warp_pixels.detach().float().cpu())
-        history_window = latents_full[:, :, : -T_new_lat]
+        self.model._latest_condition_state_pixels = None
+        self.model._latest_plucker_rays_pixels = None
+        self.model._latest_gt_gen_pixels = None
+        warp_pixels = None
+        del video_all, video_hist_abs, video_indices_t, gen_cond_dummy, buffer_depth, history_full
+        history_window = latents_full[:, :, : -T_new_lat].contiguous()
+        del latents_full
+        gc.collect()
+        torch.cuda.empty_cache()
 
+        _offload_vae_core_to_cpu(self.vae_core, self.args.offload)
         self._restore_model_to_gpu()
         pos_text, neg_text = self._prepare_text_embeddings(t5_text_embeddings, neg_t5_text_embeddings)
         last_hist_frame_cast = misc.to(self.last_hist_frame, **self.model.tensor_kwargs)
@@ -828,6 +856,8 @@ class Lyra2InferencePipeline:
                 dim=2,
             )
 
+        _offload_diffusion_to_cpu(self.model, self.args.offload)
+        _restore_vae_core_to_gpu(self.vae_core, self.model, self.args.offload)
         with self.vae_wrap.context:
             px_cast = new_generated_frames.to(self.vae_wrap.dtype) if not self.vae_wrap.is_amp else new_generated_frames
             feats_gen, enc_cache_out = self.model.vae_encode_with_cache(
@@ -839,6 +869,8 @@ class Lyra2InferencePipeline:
             )
             self.enc_feat_cache[:] = enc_cache_out
             gen_chunk_reencoded = self.model._encoder_feats_to_normalized_latents(feats_gen).to(self.history_latents.dtype)
+        _offload_vae_core_to_cpu(self.vae_core, self.args.offload)
+        self._restore_model_to_gpu()
         if self.args.offload:
             self.history_latents = torch.cat(
                 [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype).cpu()],
@@ -873,6 +905,7 @@ class Lyra2InferencePipeline:
             offload_da3 = bool(getattr(self.args, "offload_da3_diffusion", False))
             if offload_da3:
                 _offload_diffusion_to_cpu(self.model, True)
+                self.local_da3_model.to(self.model.tensor_kwargs.get("device", "cuda"))
             try:
                 da3_out = _predict_da3_depth_window(
                     da3_model=self.local_da3_model,
@@ -893,6 +926,9 @@ class Lyra2InferencePipeline:
                 )
             finally:
                 if offload_da3:
+                    self.local_da3_model.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     _restore_diffusion_to_gpu(self.model, True)
             da3_frames: List[int] = da3_out["frame_indices"]
             da3_pred = da3_out["prediction"]
