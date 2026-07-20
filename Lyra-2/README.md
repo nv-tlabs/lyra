@@ -2,7 +2,6 @@
 
 <video src="https://github.com/user-attachments/assets/f47c24c0-453e-4134-84f1-80c56613f4af" autoplay controls loop muted playsinline width="720"></video>
 
-<!--
 **Lyra 2.0: Explorable Generative 3D Worlds**<br>
 [Tianchang Shen\*](https://www.cs.toronto.edu/~shenti11/),
 [Sherwin Bahmani](https://sherwinbahmani.github.io/),
@@ -21,10 +20,7 @@
 [Xuanchi Ren\*](https://xuanchiren.com/) <br>
 \* indicates equal contribution<br>
 NVIDIA <br>
-**[Paper](https://arxiv.org/abs/2604.13036), 
--->
-
-**[Project Page](https://research.nvidia.com/labs/sil/projects/lyra2/), [HuggingFace](https://huggingface.co/nvidia/Lyra-2.0)**
+**[Paper](https://arxiv.org/abs/2604.13036), [Project Page](https://research.nvidia.com/labs/sil/projects/lyra2/), [HuggingFace](https://huggingface.co/nvidia/Lyra-2.0)**
 
 **TL;DR: Lyra 2.0 turns an image into a 3D world you can walk through, look back, and drop a robot into for real-time rendering, simulation, and immersive applications.**
 
@@ -33,7 +29,6 @@ NVIDIA <br>
 
 ## News
 - 🚀 [July 15, 2026] GUI and training code are now available! See the [GUI instructions](gui/README.md) and [training instructions](TRAINING.md).
-- 🔒 [May 8, 2026] Lyra 2.0 is temporarily anonymized. Please Google for arxiv and citation.
 - 🚀 [April 17, 2026] 4-step DMD distillation LoRA is now available! See [Fast Inference with DMD Distillation](#fast-inference-with-dmd-distillation) for details.
 - 🚀 [April 15, 2026] Paper, model weights, and inference code are now publicly available!
 
@@ -203,7 +198,6 @@ We thank the following open-source projects that this work builds upon:
 
 Some example input images included in `assets/` are sourced from the [Tanks and Temples](https://www.tanksandtemples.org/) benchmark and [Marble](https://marble.worldlabs.ai/) by World Labs. We thank the respective authors for making these resources available.
 
-<!--
 ## Citation
 
 ```bibtex
@@ -214,7 +208,6 @@ Some example input images included in `assets/` are sourced from the [Tanks and 
     year={2026}
 }
 ```
--->
 
 ## License and Contact
 
