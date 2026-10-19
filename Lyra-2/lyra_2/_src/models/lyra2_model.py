@@ -96,6 +96,12 @@ class Lyra2T2VConfig(T2VModelConfig):
     # If None, defaults to the number of spatial history slots from framepack_type.
     multibuffer_max_spatial_frames: Optional[int] = None
     warp_chunk_size: int = 2
+    # Optional chunk size for Sparse3DCache.retrieve candidate projection.
+    # None or <= 0 keeps the original single-shot vectorized path; a positive
+    # value projects candidates in chunks to bound peak activation memory while
+    # returning exactly the same selection as the single-shot path.
+    # Default None preserves the original behavior; set 32 to opt in.
+    spatial_cache_retrieve_chunk_size: Optional[int] = None
 
 
 class Lyra2Model(WANDiffusionModel):
@@ -1987,6 +1993,7 @@ class Lyra2Model(WANDiffusionModel):
                 skip_last_n=int(spatial_cache_skip_last_n),
                 random=bool(is_training),
                 max_coverage=not bool(is_training),
+                chunk_size=getattr(cfg, "spatial_cache_retrieve_chunk_size", None),
             )
             spatial_selected_frame_ids_t = torch.tensor([int(fi) for (_li, fi) in retrieved], device=device, dtype=torch.long)
             if spatial_coords_all is not None:
@@ -2654,6 +2661,7 @@ class Sparse3DCache:
         random: bool = False,
         max_coverage: bool = False,
         depth_threshold: float = 0.1,
+        chunk_size: Optional[int] = None,
     ) -> list[tuple[int, int]]:
         """Retrieve the best candidate frames from the cache.
 
@@ -2670,6 +2678,12 @@ class Sparse3DCache:
                 When multi-view targets are given, coverage is maximized
                 across the union of all views' pixels.
             depth_threshold: Tolerance for depth-based occlusion filtering.
+            chunk_size: Optional number of candidates to project per chunk.
+                ``None`` or ``<= 0`` (or a value ``>= num_cands``) keeps the
+                original single-shot vectorized path. A positive value smaller
+                than the number of candidates projects candidates in chunks,
+                bounding the peak ``[V, C, B, H', W']`` activation while
+                returning exactly the same selection.
         """
         Ht, Wt = target_hw
         num_total = len(self._world_points)
@@ -2699,78 +2713,207 @@ class Sparse3DCache:
         num_cands = avail
         pts_list = self._world_points[:avail]
 
-        # Vectorized projection of all (view, candidate) pairs at once.
-        # pts_stacked: [C, B, H', W', 3]
-        pts_stacked = torch.stack([p.to(device=device) for p in pts_list], dim=0)
-        C, Bp, Hp, Wp, _ = pts_stacked.shape
-
-        # Homogeneous coordinates: [C, B, H', W', 4, 1]
-        ones_hw = torch.ones(C, Bp, Hp, Wp, 1, device=device, dtype=pts_stacked.dtype)
-        pts_homo = torch.cat([pts_stacked, ones_hw], dim=-1).unsqueeze(-1)
+        Btot = int(target_w2c_B_4_4.shape[0])
+        pixels_per_view = Btot * Ht_ds * Wt_ds
+        n_keys = num_views * pixels_per_view
 
         # Build per-view downsampled intrinsics: [V, B, 3, 3] and [V, B, 4, 4]
         K_ds_views = [self._scale_intrinsics(K_v, scale) for K_v in K_views]
         w2c_stack = torch.stack(w2c_views, dim=0)       # [V, B, 4, 4]
         K_ds_stack = torch.stack(K_ds_views, dim=0)      # [V, B, 3, 3]
 
-        # Broadcast matmul: w2c [V,1,B,1,1,4,4] x pts_homo [1,C,B,H',W',4,1]
-        cam_homo = torch.matmul(
-            w2c_stack[:, None, :, None, None],   # [V, 1, B, 1, 1, 4, 4]
-            pts_homo[None],                      # [1, C, B, H', W', 4, 1]
-        )                                        # [V, C, B, H', W', 4, 1]
-        cam_pts = cam_homo[..., :3, :]           # [V, C, B, H', W', 3, 1]
+        def _project(pts_subset: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+            """Project a subset of cached world points through all views.
 
-        # Broadcast matmul: K [V,1,B,1,1,3,3] x cam_pts [V,C,B,H',W',3,1]
-        proj = torch.matmul(
-            K_ds_stack[:, None, :, None, None],  # [V, 1, B, 1, 1, 3, 3]
-            cam_pts,                             # [V, C, B, H', W', 3, 1]
-        )                                        # [V, C, B, H', W', 3, 1]
+            Returns ``(valid, z_all, x_all, y_all)`` where ``valid`` is
+            ``[V, c, B, H', W']``. ``c`` is the subset size, so calling this on
+            chunks never materializes the full ``[V, C, ...]`` tensor.
+            """
+            # pts_stacked: [c, B, H', W', 3]
+            pts_stacked = torch.stack([p.to(device=device) for p in pts_subset], dim=0)
+            c, Bp, Hp, Wp, _ = pts_stacked.shape
 
-        z_all = proj[..., 2, 0]                          # [V, C, B, H', W']
-        u_all = proj[..., 0, 0] / (z_all + 1e-7)
-        v_all = proj[..., 1, 0] / (z_all + 1e-7)
-        x_all = u_all.round().long()
-        y_all = v_all.round().long()
-        valid = (z_all > 0) & (x_all >= 0) & (x_all < Wt_ds) & (y_all >= 0) & (y_all < Ht_ds)
+            # Homogeneous coordinates: [c, B, H', W', 4, 1]
+            ones_hw = torch.ones(c, Bp, Hp, Wp, 1, device=device, dtype=pts_stacked.dtype)
+            pts_homo = torch.cat([pts_stacked, ones_hw], dim=-1).unsqueeze(-1)
 
-        if not valid.any():
-            log.info(
-                f"Sparse3DCache.retrieve: no valid projections for any of {num_cands} candidates "
-                f"(frame_ids={self._frame_ids[:avail]})",
-                rank0_only=True,
-            )
-            return []
+            # Broadcast matmul: w2c [V,1,B,1,1,4,4] x pts_homo [1,c,B,H',W',4,1]
+            cam_homo = torch.matmul(
+                w2c_stack[:, None, :, None, None],   # [V, 1, B, 1, 1, 4, 4]
+                pts_homo[None],                      # [1, c, B, H', W', 4, 1]
+            )                                        # [V, c, B, H', W', 4, 1]
+            cam_pts = cam_homo[..., :3, :]           # [V, c, B, H', W', 3, 1]
 
-        # valid dims: [V, C, B, H', W'] → nonzero gives (view_ids, cand_ids, b_idx, _, _)
-        view_ids, cand_ids, b_idx, _, _ = valid.nonzero(as_tuple=True)
-        y_idx = y_all[valid]
-        x_idx = x_all[valid]
-        z_vals = z_all[valid].to(torch.float32)
+            # Broadcast matmul: K [V,1,B,1,1,3,3] x cam_pts [V,c,B,H',W',3,1]
+            proj = torch.matmul(
+                K_ds_stack[:, None, :, None, None],  # [V, 1, B, 1, 1, 3, 3]
+                cam_pts,                             # [V, c, B, H', W', 3, 1]
+            )                                        # [V, c, B, H', W', 3, 1]
 
-        Btot = Bp
-        pixels_per_view = Btot * Ht_ds * Wt_ds
-        # Each (view, batch, y, x) gets a unique key so depth fusion is per-view.
-        lin_keys = view_ids * pixels_per_view + b_idx * (Ht_ds * Wt_ds) + y_idx * Wt_ds + x_idx
-        n_keys = num_views * pixels_per_view
+            z_all = proj[..., 2, 0]                          # [V, c, B, H', W']
+            u_all = proj[..., 0, 0] / (z_all + 1e-7)
+            v_all = proj[..., 1, 0] / (z_all + 1e-7)
+            x_all = u_all.round().long()
+            y_all = v_all.round().long()
+            valid = (z_all > 0) & (x_all >= 0) & (x_all < Wt_ds) & (y_all >= 0) & (y_all < Ht_ds)
+            return valid, z_all, x_all, y_all
 
-        inf_val = torch.tensor(float('inf'), device=device, dtype=z_vals.dtype)
-        min_depth = torch.full((n_keys,), inf_val, device=device, dtype=z_vals.dtype)
-        min_depth.scatter_reduce_(0, lin_keys, z_vals, reduce='amin', include_self=True)
+        chunk = int(chunk_size) if chunk_size is not None else 0
+        use_chunked = 0 < chunk < num_cands
+        inf_val = torch.tensor(float('inf'), device=device, dtype=torch.float32)
 
-        min_d_for_pts = min_depth[lin_keys]
-        if max_coverage:
-            keep = z_vals <= (min_d_for_pts + float(depth_threshold))
-            if not keep.any():
+        if use_chunked:
+            # Two-pass chunked projection. Pass 1 keeps only the global minimum
+            # depth per (view, batch, y, x) key; pass 2 re-projects each chunk
+            # and accumulates the coverage mask or the per-pixel owner. At no
+            # point is the full [V, C, B, H', W'] projection materialized.
+            min_depth = torch.full((n_keys,), inf_val, device=device, dtype=torch.float32)
+            for start in range(0, num_cands, chunk):
+                stop = min(start + chunk, num_cands)
+                valid, z_all, x_all, y_all = _project(pts_list[start:stop])
+                if not valid.any():
+                    continue
+                view_ids, _, b_idx, _, _ = valid.nonzero(as_tuple=True)
+                y_idx = y_all[valid]
+                x_idx = x_all[valid]
+                z_vals = z_all[valid].to(torch.float32)
+                lin_keys = view_ids * pixels_per_view + b_idx * (Ht_ds * Wt_ds) + y_idx * Wt_ds + x_idx
+                min_depth.scatter_reduce_(0, lin_keys, z_vals, reduce='amin', include_self=True)
+
+            if bool((min_depth == inf_val).all()):
+                log.info(
+                    f"Sparse3DCache.retrieve: no valid projections for any of {num_cands} candidates "
+                    f"(frame_ids={self._frame_ids[:avail]})",
+                    rank0_only=True,
+                )
                 return []
 
-            lin_keys_keep = lin_keys[keep]
-            cand_keep = cand_ids[keep].to(torch.long)
+            if max_coverage:
+                mask_flat = torch.zeros((num_cands * n_keys,), device=device, dtype=torch.bool)
+                for start in range(0, num_cands, chunk):
+                    stop = min(start + chunk, num_cands)
+                    valid, z_all, x_all, y_all = _project(pts_list[start:stop])
+                    if not valid.any():
+                        continue
+                    view_ids, cand_ids, b_idx, _, _ = valid.nonzero(as_tuple=True)
+                    y_idx = y_all[valid]
+                    x_idx = x_all[valid]
+                    z_vals = z_all[valid].to(torch.float32)
+                    lin_keys = view_ids * pixels_per_view + b_idx * (Ht_ds * Wt_ds) + y_idx * Wt_ds + x_idx
+                    cand_ids = cand_ids + start
+                    min_d_for_pts = min_depth[lin_keys]
+                    keep = z_vals <= (min_d_for_pts + float(depth_threshold))
+                    if not keep.any():
+                        continue
+                    lin_keys_keep = lin_keys[keep]
+                    cand_keep = cand_ids[keep].to(torch.long)
+                    flat_idx = cand_keep * n_keys + lin_keys_keep
+                    mask_flat.scatter_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.bool))
+                mask = mask_flat.view(num_cands, n_keys)
+            else:
+                big_int = torch.iinfo(torch.long).max
+                owner_lin_tmp = torch.full((n_keys,), big_int, device=device, dtype=torch.long)
+                for start in range(0, num_cands, chunk):
+                    stop = min(start + chunk, num_cands)
+                    valid, z_all, x_all, y_all = _project(pts_list[start:stop])
+                    if not valid.any():
+                        continue
+                    view_ids, cand_ids, b_idx, _, _ = valid.nonzero(as_tuple=True)
+                    y_idx = y_all[valid]
+                    x_idx = x_all[valid]
+                    z_vals = z_all[valid].to(torch.float32)
+                    lin_keys = view_ids * pixels_per_view + b_idx * (Ht_ds * Wt_ds) + y_idx * Wt_ds + x_idx
+                    cand_ids = cand_ids + start
+                    min_d_for_pts = min_depth[lin_keys]
+                    is_min = z_vals <= (min_d_for_pts + 1e-6)
+                    cid_masked = torch.where(
+                        is_min,
+                        cand_ids.to(torch.long),
+                        torch.full_like(cand_ids, big_int, dtype=torch.long),
+                    )
+                    owner_lin_tmp.scatter_reduce_(0, lin_keys, cid_masked, reduce='amin', include_self=True)
+                owner_lin = torch.where(
+                    owner_lin_tmp == big_int,
+                    torch.full_like(owner_lin_tmp, -1),
+                    owner_lin_tmp,
+                )
+                valid_owner = owner_lin[owner_lin >= 0]
+                counts = torch.bincount(valid_owner, minlength=num_cands)
+                scores_t = counts.float()
+                scores = scores_t.tolist()
+                score_map = {
+                    int(self._latent_indices[i]): {
+                        "score": float(scores[i]),
+                        "frame_id": int(self._frame_ids[i]),
+                    }
+                    for i in range(num_cands)
+                }
+                log.info(
+                    f"Sparse3DCache.retrieve scores (latent_index -> score): {score_map}",
+                    rank0_only=True,
+                )
+        else:
+            # Original single-shot projection of all (view, candidate) pairs.
+            valid, z_all, x_all, y_all = _project(pts_list)
 
-            flat_idx = cand_keep * n_keys + lin_keys_keep
-            mask_flat = torch.zeros((num_cands * n_keys,), device=device, dtype=torch.bool)
-            mask_flat.scatter_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.bool))
-            mask = mask_flat.view(num_cands, n_keys)
+            if not valid.any():
+                log.info(
+                    f"Sparse3DCache.retrieve: no valid projections for any of {num_cands} candidates "
+                    f"(frame_ids={self._frame_ids[:avail]})",
+                    rank0_only=True,
+                )
+                return []
 
+            # valid dims: [V, C, B, H', W'] → nonzero gives (view_ids, cand_ids, b_idx, _, _)
+            view_ids, cand_ids, b_idx, _, _ = valid.nonzero(as_tuple=True)
+            y_idx = y_all[valid]
+            x_idx = x_all[valid]
+            z_vals = z_all[valid].to(torch.float32)
+            # Each (view, batch, y, x) gets a unique key so depth fusion is per-view.
+            lin_keys = view_ids * pixels_per_view + b_idx * (Ht_ds * Wt_ds) + y_idx * Wt_ds + x_idx
+
+            min_depth = torch.full((n_keys,), inf_val, device=device, dtype=z_vals.dtype)
+            min_depth.scatter_reduce_(0, lin_keys, z_vals, reduce='amin', include_self=True)
+
+            min_d_for_pts = min_depth[lin_keys]
+            if max_coverage:
+                keep = z_vals <= (min_d_for_pts + float(depth_threshold))
+                if not keep.any():
+                    return []
+
+                lin_keys_keep = lin_keys[keep]
+                cand_keep = cand_ids[keep].to(torch.long)
+
+                flat_idx = cand_keep * n_keys + lin_keys_keep
+                mask_flat = torch.zeros((num_cands * n_keys,), device=device, dtype=torch.bool)
+                mask_flat.scatter_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.bool))
+                mask = mask_flat.view(num_cands, n_keys)
+            else:
+                is_min = z_vals <= (min_d_for_pts + 1e-6)
+                big_int = torch.iinfo(torch.long).max
+                cid_masked = torch.where(is_min, cand_ids.to(torch.long), torch.full_like(cand_ids, big_int, dtype=torch.long))
+
+                owner_lin_tmp = torch.full((n_keys,), big_int, device=device, dtype=torch.long)
+                owner_lin_tmp.scatter_reduce_(0, lin_keys, cid_masked, reduce='amin', include_self=True)
+                owner_lin = torch.where(
+                    owner_lin_tmp == big_int,
+                    torch.full_like(owner_lin_tmp, -1),
+                    owner_lin_tmp,
+                )
+
+                valid_owner = owner_lin[owner_lin >= 0]
+                counts = torch.bincount(valid_owner, minlength=num_cands)
+
+                scores_t = counts.float()
+                scores = scores_t.tolist()
+
+                score_map = {
+                    int(self._latent_indices[i]): {"score": float(scores[i]), "frame_id": int(self._frame_ids[i])}
+                    for i in range(num_cands)
+                }
+                log.info(f"Sparse3DCache.retrieve scores (latent_index -> score): {score_map}", rank0_only=True)
+
+        if max_coverage:
             k = min(int(num_latents), num_cands)
             if k <= 0:
                 return []
@@ -2811,27 +2954,6 @@ class Sparse3DCache:
                 return []
             top_ids = selected
         else:
-            is_min = z_vals <= (min_d_for_pts + 1e-6)
-            big_int = torch.iinfo(torch.long).max
-            cid_masked = torch.where(is_min, cand_ids.to(torch.long), torch.full_like(cand_ids, big_int, dtype=torch.long))
-
-            owner_lin = torch.full((n_keys,), -1, device=device, dtype=torch.long)
-            owner_lin_tmp = torch.full((n_keys,), big_int, device=device, dtype=torch.long)
-            owner_lin_tmp.scatter_reduce_(0, lin_keys, cid_masked, reduce='amin', include_self=True)
-            owner_lin = torch.where(owner_lin_tmp == big_int, owner_lin, owner_lin_tmp)
-
-            valid_owner = owner_lin[owner_lin >= 0]
-            counts = torch.bincount(valid_owner, minlength=num_cands)
-
-            scores_t = counts.float()
-            scores = scores_t.tolist()
-
-            score_map = {
-                int(self._latent_indices[i]): {"score": float(scores[i]), "frame_id": int(self._frame_ids[i])}
-                for i in range(num_cands)
-            }
-            log.info(f"Sparse3DCache.retrieve scores (latent_index -> score): {score_map}", rank0_only=True)
-
             if random and num_latents > 0:
                 max_score = scores_t.max() if scores_t.numel() > 0 else scores_t.new_tensor(1.0)
                 weights = torch.clamp(scores_t, min=0.0) + max_score * 0.02
