@@ -2654,6 +2654,7 @@ class Sparse3DCache:
         random: bool = False,
         max_coverage: bool = False,
         depth_threshold: float = 0.1,
+        depth_threshold_rel: float = 0.0,
     ) -> list[tuple[int, int]]:
         """Retrieve the best candidate frames from the cache.
 
@@ -2670,6 +2671,8 @@ class Sparse3DCache:
                 When multi-view targets are given, coverage is maximized
                 across the union of all views' pixels.
             depth_threshold: Tolerance for depth-based occlusion filtering.
+            depth_threshold_rel: Scale-invariant tolerance as a fraction of depth. A point is kept if
+                z <= z_min + max(depth_threshold, depth_threshold_rel * z). 0 keeps the absolute rule.
         """
         Ht, Wt = target_hw
         num_total = len(self._world_points)
@@ -2759,7 +2762,10 @@ class Sparse3DCache:
 
         min_d_for_pts = min_depth[lin_keys]
         if max_coverage:
-            keep = z_vals <= (min_d_for_pts + float(depth_threshold))
+            tol = float(depth_threshold)
+            if depth_threshold_rel > 0:
+                tol = torch.clamp(float(depth_threshold_rel) * z_vals, min=tol)
+            keep = z_vals <= (min_d_for_pts + tol)
             if not keep.any():
                 return []
 
